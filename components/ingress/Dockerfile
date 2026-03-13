@@ -16,6 +16,7 @@ FROM golang:1.24.0 AS builder
 
 WORKDIR /build
 
+ARG CGO_ENABLED=0
 ARG VERSION=dev
 ARG GIT_COMMIT=unknown
 ARG BUILD_TIME=unknown
@@ -36,10 +37,10 @@ COPY components/ingress/. ./components/ingress
 
 WORKDIR /build/components/ingress
 
-RUN CGO_ENABLED=0 go build \
+RUN CGO_ENABLED=${CGO_ENABLED} go build \
     -ldflags "-X 'github.com/alibaba/opensandbox/internal/version.Version=${VERSION}' \
-              -X 'github.com/alibaba/opensandbox/internal/version.BuildTime=${BUILD_TIME}' \
-              -X 'github.com/alibaba/opensandbox/internal/version.GitCommit=${GIT_COMMIT}'" \
+    -X 'github.com/alibaba/opensandbox/internal/version.BuildTime=${BUILD_TIME}' \
+    -X 'github.com/alibaba/opensandbox/internal/version.GitCommit=${GIT_COMMIT}'" \
     -o /build/ingress ./main.go
 
 FROM alpine:latest
