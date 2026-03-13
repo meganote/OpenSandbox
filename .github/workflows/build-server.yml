@@ -61,7 +61,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.ORGANIZATION }}/opensandbox/ingress
+          images: ${{ env.REGISTRY }}/${{ env.ORGANIZATION }}/opensandbox/server
           # generate Docker tags based on the following events/attributes
           tags: |
             type=raw,value=latest
