@@ -36,6 +36,14 @@ var (
 		ReadBufferSize:  1024,
 		WriteBufferSize: 1024,
 		CheckOrigin: func(r *http.Request) bool {
+			origin := r.Header.Get("Origin")
+			Logger.With(
+				slogger.Field{Key: "origin", Value: origin},
+				slogger.Field{Key: "host", Value: r.Host},
+				slogger.Field{Key: "url", Value: r.URL.String()},
+				slogger.Field{Key: "remote_addr", Value: r.RemoteAddr},
+				slogger.Field{Key: "headers", Value: r.Header},
+			).Debugf("WebSocket CheckOrigin: origin=%s, host=%s", origin, r.Host)
 			return true
 		},
 	}
