@@ -25,6 +25,8 @@ from io import BytesIO
 
 import pytest
 from opensandbox import Sandbox
+from opensandbox.config import ConnectionConfig
+from opensandbox.exceptions import SandboxApiException
 from opensandbox.models.execd import (
     ExecutionComplete,
     ExecutionError,
@@ -41,9 +43,22 @@ from opensandbox.models.filesystem import (
     SetPermissionEntry,
     WriteEntry,
 )
-from opensandbox.models.sandboxes import Host, NetworkPolicy, NetworkRule, PVC, SandboxImageSpec, Volume
+from opensandbox.models.sandboxes import (
+    PVC,
+    Host,
+    NetworkPolicy,
+    NetworkRule,
+    SandboxImageSpec,
+    Volume,
+)
 
-from tests.base_e2e_test import create_connection_config, get_sandbox_image
+from tests.base_e2e_test import (
+    TEST_API_KEY,
+    TEST_DOMAIN,
+    TEST_PROTOCOL,
+    create_connection_config,
+    get_sandbox_image,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -276,6 +291,25 @@ class TestSandboxE2E:
             assert connect_result.logs.stdout[0].text == "connect-ok"
         finally:
             await sandbox2.close()
+
+    @pytest.mark.timeout(120)
+    @pytest.mark.order(1)
+    async def test_01b_manual_cleanup(self):
+        sandbox = await Sandbox.create(
+            image=SandboxImageSpec(get_sandbox_image()),
+            connection_config=TestSandboxE2E.connection_config,
+            timeout=None,
+            ready_timeout=timedelta(seconds=30),
+            metadata={"tag": "manual-e2e-test"},
+        )
+        try:
+            info = await sandbox.get_info()
+            assert info.expires_at is None
+            assert info.metadata is not None
+            assert info.metadata.get("tag") == "manual-e2e-test"
+        finally:
+            await sandbox.kill()
+            await sandbox.close()
 
         logger.info("TEST 1 PASSED: Sandbox lifecycle and health test completed successfully")
 
@@ -817,6 +851,40 @@ class TestSandboxE2E:
         assert "log-line-2" in logs_text
 
     @pytest.mark.timeout(120)
+    @pytest.mark.order(3)
+    async def test_02b_run_command_with_envs(self):
+        """Test run_command env injection via RunCommandOpts.envs."""
+        await self._ensure_sandbox_created()
+        sandbox = TestSandboxE2E.sandbox
+
+        env_key = "OPEN_SANDBOX_E2E_CMD_ENV"
+        env_value = f"env-ok-{int(time.time())}"
+        probe_command = (
+            f"sh -c 'if [ -z \"${{{env_key}:-}}\" ]; then echo \"__EMPTY__\"; "
+            f"else echo \"${{{env_key}}}\"; fi'"
+        )
+
+        # Baseline: variable should be empty when not injected.
+        baseline = await sandbox.commands.run(probe_command)
+        assert baseline.error is None
+        baseline_output = "\n".join(msg.text for msg in baseline.logs.stdout).strip()
+        assert baseline_output == "__EMPTY__"
+
+        # Inject environment variables for this command only.
+        injected = await sandbox.commands.run(
+            probe_command,
+            opts=RunCommandOpts(
+                envs={
+                    env_key: env_value,
+                    "OPEN_SANDBOX_E2E_SECOND_ENV": "second-ok",
+                }
+            ),
+        )
+        assert injected.error is None
+        injected_output = "\n".join(msg.text for msg in injected.logs.stdout).strip()
+        assert injected_output == env_value
+
+    @pytest.mark.timeout(120)
     @pytest.mark.order(4)
     async def test_03_basic_filesystem_operations(self):
         """Test basic filesystem operations."""
@@ -1217,3 +1285,21 @@ class TestSandboxE2E:
         elapsed_time = (time.time() - start_time) * 1000
         logger.info(f"✓ Sandbox resume completed in {elapsed_time:.2f} ms")
         logger.info("TEST 5 PASSED: Sandbox resume operation test completed successfully")
+
+    @pytest.mark.timeout(120)
+    @pytest.mark.order(8)
+    async def test_07_x_request_id_passthrough_on_server_error(self):
+        request_id = f"e2e-py-server-{int(time.time() * 1000)}"
+        missing_sandbox_id = f"missing-{request_id}"
+        cfg = ConnectionConfig(
+            domain=TEST_DOMAIN,
+            api_key=TEST_API_KEY,
+            request_timeout=timedelta(minutes=3),
+            protocol=TEST_PROTOCOL,
+            headers={"X-Request-ID": request_id},
+        )
+
+        with pytest.raises(SandboxApiException) as ei:
+            connected = await Sandbox.connect(sandbox_id=missing_sandbox_id, connection_config=cfg)
+            await connected.get_info()
+        assert ei.value.request_id == request_id
