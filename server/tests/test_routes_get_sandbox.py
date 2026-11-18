@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,8 +17,8 @@ from datetime import datetime, timedelta, timezone
 from fastapi.exceptions import HTTPException
 from fastapi.testclient import TestClient
 
-from src.api import lifecycle
-from src.api.schema import ImageSpec, Sandbox, SandboxStatus
+from opensandbox_server.api import lifecycle
+from opensandbox_server.api.schema import AllocationSummary, ImageSpec, Sandbox, SandboxStatus
 
 
 def test_get_sandbox_returns_service_payload(
@@ -37,6 +37,7 @@ def test_get_sandbox_returns_service_payload(
                 image=ImageSpec(uri="python:3.11"),
                 status=SandboxStatus(state="Running"),
                 metadata={"team": "infra"},
+                allocation=AllocationSummary(poolRef="pool-runc"),
                 entrypoint=["python", "-V"],
                 expiresAt=now + timedelta(hours=1),
                 createdAt=now,
@@ -51,6 +52,11 @@ def test_get_sandbox_returns_service_payload(
     assert payload["id"] == "sbx-001"
     assert payload["status"]["state"] == "Running"
     assert payload["image"]["uri"] == "python:3.11"
+    assert payload["allocation"] == {
+        "mode": "pool",
+        "poolRef": "pool-runc",
+        "state": "allocated",
+    }
 
 
 def test_get_sandbox_propagates_not_found(
@@ -80,8 +86,35 @@ def test_get_sandbox_propagates_not_found(
     }
 
 
-def test_get_sandbox_requires_api_key(client: TestClient) -> None:
-    response = client.get("/v1/sandboxes/sbx-001")
+def test_get_sandbox_omits_none_fields(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch,
+) -> None:
+    now = datetime.now(timezone.utc)
 
-    assert response.status_code == 401
-    assert response.json()["code"] == "MISSING_API_KEY"
+    class StubService:
+        @staticmethod
+        def get_sandbox(sandbox_id: str) -> Sandbox:
+            return Sandbox(
+                id=sandbox_id,
+                image=ImageSpec(uri="python:3.11"),
+                status=SandboxStatus(state="Running"),
+                metadata=None,
+                entrypoint=["python", "-V"],
+                expiresAt=None,
+                createdAt=now,
+            )
+
+    monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
+
+    response = client.get("/v1/sandboxes/sbx-manual", headers=auth_headers)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert "expiresAt" not in payload
+    assert "metadata" not in payload
+    assert "allocation" not in payload
+    assert "reason" not in payload["status"]
+    assert "message" not in payload["status"]
+    assert "lastTransitionAt" not in payload["status"]

@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -58,6 +58,15 @@ public class ServerStreamEvent
     public int? ExecutionCount { get; set; }
 
     /// <summary>
+    /// Gets or sets the successful foreground command exit status (zero).
+    /// Absent for older servers, background startup, and code execution.
+    /// Non-zero command exits are reported in the error payload instead.
+    /// </summary>
+    [JsonPropertyName("exit_code")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? ExitCode { get; set; }
+
+    /// <summary>
     /// Gets or sets the execution time in milliseconds.
     /// </summary>
     [JsonPropertyName("execution_time")]
@@ -114,7 +123,11 @@ public class RunCommandRequest
     /// Gets or sets the command to run.
     /// </summary>
     [JsonPropertyName("command")]
-    public required string Command { get; set; }
+    public string? Command { get; set; }
+
+    /// <summary>Native executable and literal arguments; mutually exclusive with Command.</summary>
+    [JsonPropertyName("argv")]
+    public IReadOnlyList<string>? Argv { get; set; }
 
     /// <summary>
     /// Gets or sets the working directory.
@@ -365,4 +378,61 @@ public class SandboxMetrics
 public class PingResponse
 {
     // Empty response - ping just returns 200 OK
+}
+
+// --- Bash session API (create_session, run_in_session, delete_session) ---
+
+/// <summary>
+/// Options for creating a bash session.
+/// </summary>
+public class CreateSessionOptions
+{
+    /// <summary>
+    /// Gets or sets the optional working directory for the session.
+    /// </summary>
+    public string? WorkingDirectory { get; set; }
+}
+
+/// <summary>
+/// Response from create_session (POST /session).
+/// </summary>
+public class CreateSessionResponse
+{
+    /// <summary>
+    /// Gets or sets the session ID for run_in_session and delete_session.
+    /// </summary>
+    [JsonPropertyName("session_id")]
+    public required string SessionId { get; set; }
+}
+
+/// <summary>
+/// Options for running code in an existing bash session.
+/// </summary>
+public class RunInSessionOptions
+{
+    /// <summary>
+    /// Gets or sets the optional working directory override for this run.
+    /// </summary>
+    public string? WorkingDirectory { get; set; }
+
+    /// <summary>
+    /// Gets or sets the maximum execution time in seconds.
+    /// </summary>
+    public int? TimeoutSeconds { get; set; }
+
+}
+
+/// <summary>
+/// Request body for run_in_session (POST /session/{sessionId}/run).
+/// </summary>
+internal class RunInSessionRequest
+{
+    [JsonPropertyName("command")]
+    public required string Command { get; set; }
+
+    [JsonPropertyName("cwd")]
+    public string? Cwd { get; set; }
+
+    [JsonPropertyName("timeout")]
+    public long? Timeout { get; set; }
 }

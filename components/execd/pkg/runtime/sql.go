@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,10 +18,10 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -44,14 +44,14 @@ func (c *Controller) runSQL(ctx context.Context, request *ExecuteCodeRequest) er
 	err := c.initDB()
 	if err != nil {
 		request.Hooks.OnExecuteError(&execute.ErrorOutput{EName: "DBInitError", EValue: err.Error()})
-		log.Error("DBInitError: error initializing db server: %v", err)
+		log.Error("sql: init db server: %v", err)
 		return err
 	}
 
 	err = c.db.PingContext(ctx)
 	if err != nil {
 		request.Hooks.OnExecuteError(&execute.ErrorOutput{EName: "DBPingError", EValue: err.Error()})
-		log.Error("DBPingError: error pinging db server: %v", err)
+		log.Error("sql: ping db server: %v", err)
 		return err
 	}
 
@@ -63,11 +63,12 @@ func (c *Controller) runSQL(ctx context.Context, request *ExecuteCodeRequest) er
 	}
 }
 
-// executeSelectSQLQuery handles SELECT statements.
 func (c *Controller) executeSelectSQLQuery(ctx context.Context, request *ExecuteCodeRequest) error {
 	startAt := time.Now()
 
-	rows, err := c.db.QueryContext(ctx, request.Code)
+	// The SQL runtime intentionally executes the user's submitted SQL program
+	// against the sandbox-local database; no trusted query template is composed here.
+	rows, err := c.db.QueryContext(ctx, request.Code) // lgtm[go/sql-injection]
 	if err != nil {
 		request.Hooks.OnExecuteError(&execute.ErrorOutput{EName: "DBQueryError", EValue: err.Error()})
 		return nil
@@ -95,13 +96,27 @@ func (c *Controller) executeSelectSQLQuery(ctx context.Context, request *Execute
 		}
 		row := make([]any, len(columns))
 		for i, v := range values {
-			if v == nil {
+			switch x := v.(type) {
+			case nil:
 				row[i] = nil
-			} else {
-				row[i] = fmt.Sprintf("%v", v)
+			case []byte:
+				// MySQL's text protocol returns non-numeric columns as raw bytes.
+				// Keep non-UTF-8 payloads lossless: json.Marshal would otherwise
+				// silently replace invalid bytes with U+FFFD.
+				if utf8.Valid(x) {
+					row[i] = string(x)
+				} else {
+					row[i] = fmt.Sprintf("%v", x)
+				}
+			default:
+				row[i] = fmt.Sprintf("%v", x)
 			}
 		}
 		result = append(result, row)
+	}
+	if err := rows.Err(); err != nil {
+		request.Hooks.OnExecuteError(&execute.ErrorOutput{EName: "RowIterationError", EValue: err.Error()})
+		return nil
 	}
 
 	queryResult := QueryResult{
@@ -127,7 +142,9 @@ func (c *Controller) executeSelectSQLQuery(ctx context.Context, request *Execute
 func (c *Controller) executeUpdateSQLQuery(ctx context.Context, request *ExecuteCodeRequest) error {
 	startAt := time.Now()
 
-	result, err := c.db.ExecContext(ctx, request.Code)
+	// The SQL runtime intentionally executes the user's submitted SQL program
+	// against the sandbox-local database; no trusted query template is composed here.
+	result, err := c.db.ExecContext(ctx, request.Code) // lgtm[go/sql-injection]
 	if err != nil {
 		request.Hooks.OnExecuteError(&execute.ErrorOutput{EName: "DBExecError", EValue: err.Error()})
 		return err
@@ -155,47 +172,43 @@ func (c *Controller) executeUpdateSQLQuery(ctx context.Context, request *Execute
 
 // getQueryType extracts the first token to decide which executor to use.
 func (c *Controller) getQueryType(query string) string {
-	firstWord := strings.ToUpper(strings.Fields(query)[0])
-	return firstWord
+	fields := strings.Fields(query)
+	if len(fields) == 0 {
+		return ""
+	}
+	return strings.ToUpper(fields[0])
 }
 
+// sandboxMySQLDSN is the local sandbox database. Tests point it at a closed
+// port; production keeps the historical default.
+var sandboxMySQLDSN = "root:@tcp(127.0.0.1:3306)/"
+
 // initDB lazily opens the local sandbox database.
+// A failed attempt closes the pool and leaves c.db nil, so a later call can
+// try again. sync.Once made the first dial error permanent.
 func (c *Controller) initDB() error {
-	var initErr error
-	c.dbOnce.Do(func() {
-		dsn := "root:@tcp(127.0.0.1:3306)/"
-		db, err := sql.Open("mysql", dsn)
-		if err != nil {
-			initErr = err
-			return
-		}
-
-		err = db.Ping()
-		if err != nil {
-			initErr = err
-			return
-		}
-
-		_, err = db.Exec("CREATE DATABASE IF NOT EXISTS sandbox")
-		if err != nil {
-			initErr = err
-			return
-		}
-
-		_, err = db.Exec("USE sandbox")
-		if err != nil {
-			initErr = err
-			return
-		}
-
-		c.db = db
-	})
-
-	if initErr != nil {
-		return initErr
+	c.dbMu.Lock()
+	defer c.dbMu.Unlock()
+	if c.db != nil {
+		return nil
 	}
-	if c.db == nil {
-		return errors.New("db is not initialized")
+
+	db, err := sql.Open("mysql", sandboxMySQLDSN)
+	if err != nil {
+		return err
 	}
+	if err = db.Ping(); err != nil {
+		_ = db.Close()
+		return err
+	}
+	if _, err = db.Exec("CREATE DATABASE IF NOT EXISTS sandbox"); err != nil {
+		_ = db.Close()
+		return err
+	}
+	if _, err = db.Exec("USE sandbox"); err != nil {
+		_ = db.Close()
+		return err
+	}
+	c.db = db
 	return nil
 }

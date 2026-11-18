@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,6 +22,19 @@ namespace OpenSandbox.Services;
 /// </summary>
 public interface IExecdCommands
 {
+    /// <summary>Runs native executable arguments without shell expansion.</summary>
+    IAsyncEnumerable<ServerStreamEvent> RunStreamAsync(
+        IReadOnlyList<string> argv,
+        RunCommandOptions? options = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>Runs native executable arguments and collects the result.</summary>
+    Task<Execution> RunAsync(
+        IReadOnlyList<string> argv,
+        RunCommandOptions? options = null,
+        ExecutionHandlers? handlers = null,
+        CancellationToken cancellationToken = default);
+
     /// <summary>
     /// Runs a command and streams server events (SSE).
     /// This is the lowest-level API for command execution.
@@ -51,6 +64,27 @@ public interface IExecdCommands
         string command,
         RunCommandOptions? options = null,
         ExecutionHandlers? handlers = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Persists an environment variable for future commands and sessions.
+    /// Appends <c>KEY=VALUE</c> to the sandbox env file that the runtime loads for
+    /// every command and session (the file named by the sandbox's <c>EXECD_ENVS</c>
+    /// variable, resolved inside the sandbox). Keys must match
+    /// <c>[A-Za-z_][A-Za-z0-9_]*</c>. Values without a single quote are stored
+    /// verbatim; values containing a single quote use the env file's double-quoted
+    /// form, in which shell-style <c>$NAME</c> sequences may be expanded when the
+    /// runtime loads the file. The env file is append-only: the last write for a
+    /// key wins.
+    /// </summary>
+    /// <param name="key">Environment variable name.</param>
+    /// <param name="value">Environment variable value.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <exception cref="InvalidArgumentException">Thrown when <paramref name="key"/> or <paramref name="value"/> is invalid.</exception>
+    /// <exception cref="SandboxException">Thrown when the sandbox fails to persist the variable.</exception>
+    Task SetEnvAsync(
+        string key,
+        string value,
         CancellationToken cancellationToken = default);
 
     /// <summary>
@@ -88,5 +122,46 @@ public interface IExecdCommands
     Task<CommandLogs> GetBackgroundCommandLogsAsync(
         string executionId,
         long? cursor = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Creates a new bash session with optional working directory.
+    /// The session maintains shell state (working directory, environment) across multiple <see cref="RunInSessionAsync"/> calls.
+    /// </summary>
+    /// <param name="options">Optional options (e.g. initial working directory).</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The session ID for use with <see cref="RunInSessionAsync"/> and <see cref="DeleteSessionAsync"/>.</returns>
+    /// <exception cref="SandboxException">Thrown when the execd service request fails.</exception>
+    Task<string> CreateSessionAsync(
+        CreateSessionOptions? options = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Runs a shell command in an existing bash session and returns the execution result (SSE consumed internally).
+    /// </summary>
+    /// <param name="sessionId">Session ID from <see cref="CreateSessionAsync"/>.</param>
+    /// <param name="command">Shell command to execute.</param>
+    /// <param name="options">Optional working directory and timeout for this run.</param>
+    /// <param name="handlers">Optional event handlers for real-time processing.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The execution result with stdout/stderr and completion status.</returns>
+    /// <exception cref="InvalidArgumentException">Thrown when <paramref name="sessionId"/> or <paramref name="command"/> is null or empty.</exception>
+    /// <exception cref="SandboxException">Thrown when the execd service request fails.</exception>
+    Task<Execution> RunInSessionAsync(
+        string sessionId,
+        string command,
+        RunInSessionOptions? options = null,
+        ExecutionHandlers? handlers = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Deletes a bash session and releases resources.
+    /// </summary>
+    /// <param name="sessionId">Session ID to delete (from <see cref="CreateSessionAsync"/>).</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <exception cref="InvalidArgumentException">Thrown when <paramref name="sessionId"/> is null or empty.</exception>
+    /// <exception cref="SandboxException">Thrown when the execd service request fails.</exception>
+    Task DeleteSessionAsync(
+        string sessionId,
         CancellationToken cancellationToken = default);
 }

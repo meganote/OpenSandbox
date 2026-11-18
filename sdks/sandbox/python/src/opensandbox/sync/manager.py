@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,16 +19,28 @@ Synchronous SandboxManager implementation.
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Literal
 
 from opensandbox.config.connection_sync import ConnectionConfigSync
+from opensandbox.models.diagnostics import DiagnosticContent, DiagnosticContext
 from opensandbox.models.sandboxes import (
+    CreateSnapshotRequest,
     PagedSandboxInfos,
+    PagedSnapshotInfos,
     SandboxFilter,
     SandboxInfo,
     SandboxRenewResponse,
+    SnapshotFilter,
+    SnapshotInfo,
+)
+from opensandbox.models.templates import (
+    CreateTemplateRequest,
+    PagedTemplateInfos,
+    TemplateFilter,
+    TemplateInfo,
 )
 from opensandbox.sync.adapters.factory import AdapterFactorySync
+from opensandbox.sync.services.diagnostics import DiagnosticsSync
 from opensandbox.sync.services.sandbox import SandboxesSync
 
 logger = logging.getLogger(__name__)
@@ -58,7 +70,10 @@ class SandboxManagerSync:
     """
 
     def __init__(
-        self, sandbox_service: SandboxesSync, connection_config: ConnectionConfigSync
+        self,
+        sandbox_service: SandboxesSync,
+        connection_config: ConnectionConfigSync,
+        diagnostics_service: DiagnosticsSync | None = None,
     ) -> None:
         """
         Internal constructor for SandboxManagerSync.
@@ -68,9 +83,14 @@ class SandboxManagerSync:
         Args:
             sandbox_service: Service for sandbox operations
             connection_config: Connection configuration (shared transport, headers, timeouts)
+            diagnostics_service: Optional service for sandbox diagnostics
         """
         self._sandbox_service = sandbox_service
         self._connection_config = connection_config
+        self._diagnostics_service = (
+            diagnostics_service
+            or AdapterFactorySync(connection_config).create_diagnostics_service()
+        )
 
     @property
     def connection_config(self) -> ConnectionConfigSync:
@@ -78,7 +98,9 @@ class SandboxManagerSync:
         return self._connection_config
 
     @classmethod
-    def create(cls, connection_config: ConnectionConfigSync | None = None) -> "SandboxManagerSync":
+    def create(
+        cls, connection_config: ConnectionConfigSync | None = None
+    ) -> "SandboxManagerSync":
         """
         Create a SandboxManagerSync instance with the provided configuration (blocking).
 
@@ -89,10 +111,13 @@ class SandboxManagerSync:
         Returns:
             Configured sandbox manager instance
         """
-        config = (connection_config or ConnectionConfigSync()).with_transport_if_missing()
+        config = (
+            connection_config or ConnectionConfigSync()
+        ).with_transport_if_missing()
         factory = AdapterFactorySync(config)
         sandbox_service = factory.create_sandbox_service()
-        return cls(sandbox_service, config)
+        diagnostics_service = factory.create_diagnostics_service()
+        return cls(sandbox_service, config, diagnostics_service)
 
     def list_sandbox_infos(self, filter: SandboxFilter) -> PagedSandboxInfos:
         """
@@ -122,12 +147,56 @@ class SandboxManagerSync:
         Raises:
             SandboxException: if the operation fails
         """
-        logger.debug("Getting info for sandbox: %s", sandbox_id)
+        logger.debug(f"Getting info for sandbox: {sandbox_id}")
         return self._sandbox_service.get_sandbox_info(sandbox_id)
+
+    def get_diagnostic_context(self, sandbox_id: str) -> DiagnosticContext:
+        """Get backend routing context without connecting to execd."""
+        return self._diagnostics_service.get_context(sandbox_id)
+
+    def get_diagnostic_logs(
+        self,
+        sandbox_id: str,
+        scope: str,
+    ) -> DiagnosticContent:
+        """
+        Get diagnostic log content for a sandbox by ID.
+
+        Args:
+            sandbox_id: Sandbox ID to retrieve diagnostics for
+            scope: Required diagnostic scope such as "container", "lifecycle", or "all".
+        """
+        return self._diagnostics_service.get_logs(sandbox_id, scope)
+
+    def get_diagnostic_events(
+        self,
+        sandbox_id: str,
+        scope: str,
+    ) -> DiagnosticContent:
+        """
+        Get diagnostic event content for a sandbox by ID.
+
+        Args:
+            sandbox_id: Sandbox ID to retrieve diagnostics for
+            scope: Required diagnostic scope such as "runtime", "lifecycle", or "all".
+        """
+        return self._diagnostics_service.get_events(sandbox_id, scope)
+
+    def patch_sandbox_metadata(
+        self, sandbox_id: str, patch: dict[str, str | None]
+    ) -> SandboxInfo:
+        """
+        Patch metadata for a sandbox.
+
+        String values add or replace keys; None deletes keys.
+        """
+        logger.info(f"Patching metadata for sandbox: {sandbox_id}")
+        return self._sandbox_service.patch_sandbox_metadata(sandbox_id, patch)
 
     def kill_sandbox(self, sandbox_id: str) -> None:
         """
-        Terminate a single sandbox.
+        Request irreversible termination of the remote sandbox. Returns when
+        deletion is accepted; runtime cleanup may continue afterward.
 
         Args:
             sandbox_id: Sandbox ID to terminate
@@ -135,11 +204,13 @@ class SandboxManagerSync:
         Raises:
             SandboxException: if the operation fails
         """
-        logger.info("Terminating sandbox: %s", sandbox_id)
+        logger.info(f"Terminating sandbox: {sandbox_id}")
         self._sandbox_service.kill_sandbox(sandbox_id)
-        logger.info("Successfully terminated sandbox: %s", sandbox_id)
+        logger.info(f"Sandbox deletion accepted: {sandbox_id}")
 
-    def renew_sandbox(self, sandbox_id: str, timeout: timedelta) -> SandboxRenewResponse:
+    def renew_sandbox(
+        self, sandbox_id: str, timeout: timedelta
+    ) -> SandboxRenewResponse:
         """
         Renew expiration time for a single sandbox.
 
@@ -154,8 +225,10 @@ class SandboxManagerSync:
         """
         # Use timezone-aware UTC datetime to avoid cross-timezone ambiguity.
         new_expiration = datetime.now(timezone.utc) + timeout
-        logger.info("Renew expiration for sandbox %s to %s", sandbox_id, new_expiration)
-        return self._sandbox_service.renew_sandbox_expiration(sandbox_id, new_expiration)
+        logger.info(f"Renew expiration for sandbox {sandbox_id} to {new_expiration}")
+        return self._sandbox_service.renew_sandbox_expiration(
+            sandbox_id, new_expiration
+        )
 
     def pause_sandbox(self, sandbox_id: str) -> None:
         """
@@ -167,7 +240,7 @@ class SandboxManagerSync:
         Raises:
             SandboxException: if the operation fails
         """
-        logger.info("Pausing sandbox: %s", sandbox_id)
+        logger.info(f"Pausing sandbox: {sandbox_id}")
         self._sandbox_service.pause_sandbox(sandbox_id)
 
     def resume_sandbox(self, sandbox_id: str) -> None:
@@ -180,8 +253,51 @@ class SandboxManagerSync:
         Raises:
             SandboxException: if the operation fails
         """
-        logger.info("Resuming sandbox: %s", sandbox_id)
+        logger.info(f"Resuming sandbox: {sandbox_id}")
         self._sandbox_service.resume_sandbox(sandbox_id)
+
+    def create_snapshot(
+        self,
+        sandbox_id: str,
+        name: str | None = None,
+        mode: Literal["full", "rootfsOnly"] | None = None,
+    ) -> SnapshotInfo:
+        """Create a snapshot from a sandbox (blocking).
+
+        ``mode`` selects what the snapshot persists; see the async
+        :meth:`SandboxManager.create_snapshot` for details.
+        """
+        return self._sandbox_service.create_snapshot(
+            sandbox_id, CreateSnapshotRequest(name=name, mode=mode)
+        )
+
+    def get_snapshot(self, snapshot_id: str) -> SnapshotInfo:
+        """Get information for a snapshot by id (blocking)."""
+        return self._sandbox_service.get_snapshot(snapshot_id)
+
+    def list_snapshots(self, filter: SnapshotFilter) -> PagedSnapshotInfos:
+        """List snapshots with filtering options (blocking)."""
+        return self._sandbox_service.list_snapshots(filter)
+
+    def delete_snapshot(self, snapshot_id: str) -> None:
+        """Delete a snapshot by id (blocking)."""
+        self._sandbox_service.delete_snapshot(snapshot_id)
+
+    def create_template(self, request: CreateTemplateRequest) -> TemplateInfo:
+        """Create a fsb template (golden-image build); the build is asynchronous (blocking)."""
+        return self._sandbox_service.create_template(request)
+
+    def get_template(self, template_id: str) -> TemplateInfo:
+        """Get a template with its latest build status by id (blocking)."""
+        return self._sandbox_service.get_template(template_id)
+
+    def list_templates(self, filter: TemplateFilter) -> PagedTemplateInfos:
+        """List templates with metadata filtering and pagination options (blocking)."""
+        return self._sandbox_service.list_templates(filter)
+
+    def delete_template(self, template_id: str) -> None:
+        """Delete a template by id (blocking). Running sandboxes are unaffected."""
+        self._sandbox_service.delete_template(template_id)
 
     def close(self) -> None:
         """
@@ -195,7 +311,9 @@ class SandboxManagerSync:
         try:
             self._connection_config.close_transport_if_owned()
         except Exception as e:
-            logger.warning("Error closing resources for sandbox manager: %s", e, exc_info=True)
+            logger.warning(
+                f"Error closing resources for sandbox manager: {e}", exc_info=True
+            )
 
     def __enter__(self) -> "SandboxManagerSync":
         """Sync context manager entry."""

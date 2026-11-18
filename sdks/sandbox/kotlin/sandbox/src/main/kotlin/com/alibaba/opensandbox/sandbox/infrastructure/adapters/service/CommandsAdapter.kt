@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Alibaba Group Holding Ltd.
+ * Copyright 2025 The OpenSandbox Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,32 +26,83 @@ import com.alibaba.opensandbox.sandbox.api.execd.infrastructure.ServerException
 import com.alibaba.opensandbox.sandbox.api.execd.infrastructure.Success
 import com.alibaba.opensandbox.sandbox.api.models.execd.EventNode
 import com.alibaba.opensandbox.sandbox.domain.exceptions.InvalidArgumentException
-import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxApiException
-import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxError
-import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxError.Companion.UNEXPECTED_RESPONSE
+import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxInternalException
 import com.alibaba.opensandbox.sandbox.domain.models.execd.executions.CommandLogs
 import com.alibaba.opensandbox.sandbox.domain.models.execd.executions.CommandStatus
 import com.alibaba.opensandbox.sandbox.domain.models.execd.executions.Execution
+import com.alibaba.opensandbox.sandbox.domain.models.execd.executions.ExecutionHandlers
 import com.alibaba.opensandbox.sandbox.domain.models.execd.executions.RunCommandRequest
+import com.alibaba.opensandbox.sandbox.domain.models.execd.executions.RunInSessionRequest
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxEndpoint
 import com.alibaba.opensandbox.sandbox.domain.services.Commands
 import com.alibaba.opensandbox.sandbox.infrastructure.adapters.converter.ExecutionConverter.toApiRunCommandRequest
 import com.alibaba.opensandbox.sandbox.infrastructure.adapters.converter.ExecutionConverter.toCommandStatus
 import com.alibaba.opensandbox.sandbox.infrastructure.adapters.converter.ExecutionEventDispatcher
 import com.alibaba.opensandbox.sandbox.infrastructure.adapters.converter.jsonParser
-import com.alibaba.opensandbox.sandbox.infrastructure.adapters.converter.parseSandboxError
+import com.alibaba.opensandbox.sandbox.infrastructure.adapters.converter.toCommandTimeoutMillis
+import com.alibaba.opensandbox.sandbox.infrastructure.adapters.converter.toSandboxApiException
 import com.alibaba.opensandbox.sandbox.infrastructure.adapters.converter.toSandboxException
+import kotlinx.serialization.json.Json
 import okhttp3.Headers.Companion.toHeaders
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import org.slf4j.LoggerFactory
+import com.alibaba.opensandbox.sandbox.api.models.execd.CreateSessionRequest as CreateSessionRequestApi
+import com.alibaba.opensandbox.sandbox.api.models.execd.RunInSessionRequest as RunInSessionRequestApi
+
+/** Quotes a string as a single POSIX shell word. */
+private fun shellQuote(value: String): String = "'${value.replace("'", "'\\''")}'"
+
+private val ENV_KEY_REGEX = Regex("^[A-Za-z_][A-Za-z0-9_]*\\z")
+
+/** Escapes a value for the runtime env file's double-quoted form. */
+private fun escapeDoubleQuoted(value: String): String =
+    value
+        .replace("\\", "\\\\")
+        .replace("\"", "\\\"")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
 
 /**
- * Implementation of [Commands] that adapts OpenAPI-generated [CommandApi].
- *
- * This adapter handles command execution within sandboxes, providing both
- * synchronous and streaming execution modes with proper session management.
+ * Builds the sandbox-side snippet that appends KEY=VALUE to the env file named
+ * by the sandbox's EXECD_ENVS variable. Values without a single quote use the
+ * runtime env file's lossless single-quoted form; otherwise the double-quoted
+ * form is used (shell-style `$NAME` sequences in such values may be expanded
+ * when the runtime loads the file).
+ */
+private fun buildSetEnvCommand(
+    key: String,
+    value: String,
+): String {
+    if (!ENV_KEY_REGEX.matches(key)) {
+        throw InvalidArgumentException("setEnv key must match [A-Za-z_][A-Za-z0-9_]*, got '$key'")
+    }
+    if (value.contains('\u0000')) {
+        throw InvalidArgumentException("setEnv value cannot contain NUL bytes")
+    }
+    val entry =
+        if (value.contains('\'')) {
+            "$key=\"${escapeDoubleQuoted(value)}\""
+        } else {
+            "$key='$value'"
+        }
+    return listOf(
+        "if [ -z \"\${EXECD_ENVS:-}\" ]; then " +
+            "printf '%s\\n' " +
+            "'EXECD_ENVS is not set; cannot persist environment variable $key' " +
+            ">&2; exit 1; fi",
+        "mkdir -p \"\$(dirname \"\$EXECD_ENVS\")\"",
+        "printf '%s\\n' ${shellQuote(entry)} >> \"\$EXECD_ENVS\"",
+    ).joinToString("\n")
+}
+
+/**
+ * Implementation of [Commands] that adapts OpenAPI-generated APIs and handles
+ * streaming command execution for sandboxes.
  */
 internal class CommandsAdapter(
     private val httpClientProvider: HttpClientProvider,
@@ -59,76 +110,78 @@ internal class CommandsAdapter(
 ) : Commands {
     companion object {
         private const val RUN_COMMAND_PATH = "/command"
+        private const val SESSION_PATH_SEGMENT = "session"
     }
 
+    private val commandJson = Json(jsonParser) { explicitNulls = false }
     private val logger = LoggerFactory.getLogger(CommandsAdapter::class.java)
-    private val api =
-        CommandApi(
-            "${httpClientProvider.config.protocol}://${execdEndpoint.endpoint}",
-            httpClientProvider.httpClient.newBuilder()
-                .addInterceptor { chain ->
-                    val requestBuilder = chain.request().newBuilder()
-                    execdEndpoint.headers.forEach { (key, value) ->
-                        requestBuilder.header(key, value)
-                    }
-                    chain.proceed(requestBuilder.build())
+    private val execdBaseUrl = "${httpClientProvider.config.protocol}://${execdEndpoint.endpoint}"
+    private val execdApiClient =
+        httpClientProvider.httpClient.newBuilder()
+            .addInterceptor { chain ->
+                val requestBuilder = chain.request().newBuilder()
+                execdEndpoint.headers.forEach { (key, value) ->
+                    requestBuilder.header(key, value)
                 }
-                .build(),
+                chain.proceed(requestBuilder.build())
+            }
+            .build()
+    private val commandApi =
+        CommandApi(
+            execdBaseUrl,
+            execdApiClient,
         )
 
     override fun run(request: RunCommandRequest): Execution {
-        if (request.command.isEmpty()) {
+        if (request.argv == null && request.command.isEmpty()) {
             throw InvalidArgumentException("Command cannot be empty")
         }
         try {
             val httpRequest =
                 Request.Builder()
-                    .url("${httpClientProvider.config.protocol}://${execdEndpoint.endpoint}$RUN_COMMAND_PATH")
+                    .url("$execdBaseUrl$RUN_COMMAND_PATH")
                     .post(
-                        jsonParser.encodeToString(request.toApiRunCommandRequest()).toRequestBody("application/json".toMediaType()),
+                        commandJson.encodeToString(request.toApiRunCommandRequest()).toRequestBody("application/json".toMediaType()),
                     )
                     .headers(execdEndpoint.headers.toHeaders())
                     .build()
 
-            val execution = Execution()
-
-            httpClientProvider.sseClient.newCall(httpRequest).execute().use { response ->
-                if (!response.isSuccessful) {
-                    val errorBodyString = response.body?.string()
-                    val sandboxError = parseSandboxError(errorBodyString)
-                    val message = "Failed to run commands. Status code: ${response.code}, Body: $errorBodyString"
-                    throw SandboxApiException(
-                        message = message,
-                        statusCode = response.code,
-                        error = sandboxError ?: SandboxError(UNEXPECTED_RESPONSE),
-                        requestId = response.header("X-Request-ID"),
-                    )
-                }
-
-                response.body?.byteStream()?.bufferedReader(Charsets.UTF_8)?.use { reader ->
-                    val dispatcher = ExecutionEventDispatcher(execution, request.handlers)
-                    reader.lineSequence()
-                        .filter(String::isNotBlank)
-                        .forEach { line ->
-                            try {
-                                val eventNode = jsonParser.decodeFromString<EventNode>(line)
-                                dispatcher.dispatch(eventNode)
-                            } catch (e: Exception) {
-                                logger.error("Failed to parse SSE line: {}", line, e)
-                            }
-                        }
-                }
-            }
-            return execution
+            return executeStreamingRequest(
+                httpRequest = httpRequest,
+                handlers = request.handlers,
+                isBackground = request.background,
+                failureMessage = { statusCode, errorBody ->
+                    "Failed to run commands. Status code: $statusCode, Body: $errorBody"
+                },
+            )
         } catch (e: Exception) {
             logger.error("Failed to run command (length: {})", request.command.length, e)
             throw e.toSandboxException()
         }
     }
 
+    override fun setEnv(
+        key: String,
+        value: String,
+    ) {
+        val command = buildSetEnvCommand(key, value)
+        val execution = run(RunCommandRequest.builder().command(command).build())
+        // A foreground command only reports exitCode 0 after a confirmed
+        // execution_complete event; a missing exit code (e.g. a dropped
+        // stream) is treated as failure because the append was never confirmed.
+        val failed = execution.error != null || execution.exitCode != 0
+        if (failed) {
+            val stderr = execution.logs.stderr.joinToString("") { it.text }.trim()
+            val detail =
+                stderr.ifEmpty { execution.error?.value?.trim().orEmpty() }
+            val message = "commands.setEnv failed for '$key'" + if (detail.isNotEmpty()) ": $detail" else ""
+            throw SandboxInternalException(message)
+        }
+    }
+
     override fun interrupt(executionId: String) {
         try {
-            api.interruptCommand(executionId)
+            commandApi.interruptCommand(executionId)
         } catch (e: Exception) {
             logger.error("Failed to interrupt command", e)
             throw e.toSandboxException()
@@ -137,7 +190,7 @@ internal class CommandsAdapter(
 
     override fun getCommandStatus(executionId: String): CommandStatus {
         return try {
-            val status = api.getCommandStatus(executionId)
+            val status = commandApi.getCommandStatus(executionId)
             status.toCommandStatus()
         } catch (e: Exception) {
             logger.error("Failed to get command status", e)
@@ -150,7 +203,7 @@ internal class CommandsAdapter(
         cursor: Long?,
     ): CommandLogs {
         return try {
-            val localVarResponse = api.getBackgroundCommandLogsWithHttpInfo(executionId, cursor)
+            val localVarResponse = commandApi.getBackgroundCommandLogsWithHttpInfo(executionId, cursor)
             val content =
                 when (localVarResponse.responseType) {
                     ResponseType.Success -> (localVarResponse as Success<*>).data as String
@@ -161,7 +214,7 @@ internal class CommandsAdapter(
                     ResponseType.ClientError -> {
                         val localVarError = localVarResponse as ClientError<*>
                         throw ClientException(
-                            "Client error : ${localVarError.statusCode} ${localVarError.message.orEmpty()}",
+                            "Client error : ${localVarError.statusCode} ${localVarError.message.orEmpty()} ${localVarError.body}",
                             localVarError.statusCode,
                             localVarResponse,
                         )
@@ -184,4 +237,124 @@ internal class CommandsAdapter(
             throw e.toSandboxException()
         }
     }
+
+    override fun createSession(workingDirectory: String?): String {
+        if (workingDirectory != null && workingDirectory.isBlank()) {
+            throw InvalidArgumentException("workingDirectory cannot be blank when provided")
+        }
+        return try {
+            val apiRequest = workingDirectory?.let { CreateSessionRequestApi(cwd = it) }
+            commandApi.createSession(apiRequest).sessionId
+        } catch (e: Exception) {
+            logger.error("Failed to create session", e)
+            throw e.toSandboxException()
+        }
+    }
+
+    override fun runInSession(
+        sessionId: String,
+        request: RunInSessionRequest,
+    ): Execution {
+        if (sessionId.isBlank()) {
+            throw InvalidArgumentException("session_id cannot be empty")
+        }
+        try {
+            val apiRequest =
+                RunInSessionRequestApi(
+                    command = request.command,
+                    cwd = request.workingDirectory,
+                    timeout = request.timeout?.toCommandTimeoutMillis(),
+                )
+            val runUrl =
+                execdBaseUrl
+                    .toHttpUrlOrNull()!!
+                    .newBuilder()
+                    .addPathSegment(SESSION_PATH_SEGMENT)
+                    .addPathSegment(sessionId)
+                    .addPathSegment("run")
+                    .build()
+                    .toString()
+            val httpRequest =
+                Request.Builder()
+                    .url(runUrl)
+                    .post(
+                        jsonParser.encodeToString(apiRequest).toRequestBody("application/json".toMediaType()),
+                    )
+                    .headers(execdEndpoint.headers.toHeaders())
+                    .build()
+
+            return executeStreamingRequest(
+                httpRequest = httpRequest,
+                handlers = request.handlers,
+                isBackground = false,
+                failureMessage = { statusCode, errorBody ->
+                    "run_in_session failed. Status: $statusCode, Body: $errorBody"
+                },
+            )
+        } catch (e: Exception) {
+            logger.error("Failed to run in session", e)
+            throw e.toSandboxException()
+        }
+    }
+
+    override fun deleteSession(sessionId: String) {
+        if (sessionId.isBlank()) {
+            throw InvalidArgumentException("session_id cannot be empty")
+        }
+        try {
+            commandApi.deleteSession(sessionId)
+        } catch (e: Exception) {
+            logger.error("Failed to delete session", e)
+            throw e.toSandboxException()
+        }
+    }
+
+    private fun executeStreamingRequest(
+        httpRequest: Request,
+        handlers: ExecutionHandlers?,
+        isBackground: Boolean,
+        failureMessage: (Int, String?) -> String,
+    ): Execution {
+        val execution = Execution()
+
+        httpClientProvider.sseClient.newCall(httpRequest).execute().use { response ->
+            ensureSuccessfulStreamingResponse(response, failureMessage)
+
+            response.body?.byteStream()?.bufferedReader(Charsets.UTF_8)?.use { reader ->
+                val dispatcher = ExecutionEventDispatcher(execution, handlers)
+                for (line in ExecdEventSupport.eventLines(reader)) {
+                    val eventNode = decodeEventLine(line) ?: continue
+                    try {
+                        dispatcher.dispatch(eventNode)
+                    } catch (e: Exception) {
+                        logger.error("Failed to dispatch SSE event: {}", eventNode, e)
+                    }
+                    if (isBackground && eventNode.type == "execution_complete") break
+                }
+            }
+        }
+
+        if (!isBackground) {
+            execution.exitCode = inferForegroundExitCode(execution)
+        }
+        return execution
+    }
+
+    private fun ensureSuccessfulStreamingResponse(
+        response: Response,
+        failureMessage: (Int, String?) -> String,
+    ) {
+        if (response.isSuccessful) {
+            return
+        }
+
+        throw response.toSandboxApiException(message = failureMessage)
+    }
+
+    private fun decodeEventLine(line: String): EventNode? =
+        ExecdEventSupport.decodeEventLine(line) { failingLine, error ->
+            logger.error("Failed to parse SSE line: {}", failingLine, error)
+        }
+
+    private fun inferForegroundExitCode(execution: Execution): Int? = ExecdEventSupport.inferForegroundExitCode(execution)
 }

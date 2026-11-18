@@ -1,0 +1,222 @@
+// Copyright 2026 The OpenSandbox Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package main
+
+import (
+	"encoding/json"
+	"io"
+	"net/http"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/alibaba/opensandbox/egress/pkg/constants"
+	"github.com/alibaba/opensandbox/egress/pkg/log"
+	"github.com/alibaba/opensandbox/egress/pkg/policy"
+	slogger "github.com/alibaba/opensandbox/internal/logger"
+)
+
+const maxPolicyBodyBytes = 1 << 20
+
+func readPolicyRequestBody(r *http.Request) (string, error) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxPolicyBodyBytes))
+	if err != nil {
+		return "", err
+	}
+	raw := strings.TrimSpace(string(body))
+	log.Infof("policy API: request body (%s %s): %s", r.Method, r.URL.Path, raw)
+	return raw, nil
+}
+
+func patchMergedPolicy(base *policy.NetworkPolicy, patchRules []policy.EgressRule) (*policy.NetworkPolicy, error) {
+	if base == nil {
+		base = policy.DefaultDenyPolicy()
+	}
+	baseCopy := *base
+	baseCopy.Egress = append([]policy.EgressRule(nil), base.Egress...)
+
+	merged := mergeEgressRules(baseCopy.Egress, patchRules)
+	rawMerged, err := json.Marshal(policy.NetworkPolicy{
+		DefaultAction: baseCopy.DefaultAction,
+		Egress:        merged,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return policy.ParsePolicy(string(rawMerged))
+}
+
+func mergeEgressRules(base, additions []policy.EgressRule) []policy.EgressRule {
+	if len(additions) == 0 {
+		return base
+	}
+	out := make([]policy.EgressRule, 0, len(base)+len(additions))
+	patched := make(map[string]struct{}, len(additions))
+
+	// patch rules win on same scope; base fills the rest
+	for _, r := range additions {
+		key := mergeKey(r)
+		if _, ok := patched[key]; ok {
+			continue
+		}
+		patched[key] = struct{}{}
+		out = append(out, r)
+	}
+	// Only patched scopes are replaced: dropping an untouched same-scope base
+	// duplicate could remove a shadowing deny (nft is deny-wins) and fail open.
+	for _, r := range base {
+		if _, ok := patched[mergeKey(r)]; !ok {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// removeRulesByTarget removes rules matching targets (domains
+// case-insensitively, misses ignored). An explicit empty entry addresses
+// port-only rules: listing "" removes all of them.
+func removeRulesByTarget(rules []policy.EgressRule, targets []string) (kept, removed []policy.EgressRule) {
+	if len(targets) == 0 || len(rules) == 0 {
+		return rules, nil
+	}
+	removeSet := make(map[string]struct{}, len(targets))
+	removePortOnly := false
+	for _, t := range targets {
+		key := strings.ToLower(strings.TrimSpace(t))
+		if key == "" {
+			removePortOnly = true
+			continue
+		}
+		removeSet[key] = struct{}{}
+	}
+	kept = make([]policy.EgressRule, 0, len(rules))
+	for _, r := range rules {
+		_, targetListed := removeSet[strings.ToLower(r.Target)]
+		if targetListed || (removePortOnly && r.Target == "") {
+			removed = append(removed, r)
+		} else {
+			kept = append(kept, r)
+		}
+	}
+	return kept, removed
+}
+
+// mergeKey: (lowercased target, sorted ports) — differently-scoped rules
+// must not evict each other.
+func mergeKey(r policy.EgressRule) string {
+	key := strings.ToLower(r.Target)
+	if len(r.Ports) == 0 {
+		return key
+	}
+	ports := append([]int(nil), r.Ports...)
+	sort.Ints(ports)
+	portStrs := make([]string, len(ports))
+	for i, port := range ports {
+		portStrs[i] = strconv.Itoa(port)
+	}
+	return key + "|ports=" + strings.Join(portStrs, ",")
+}
+
+func maxEgressRulesFromEnv() int {
+	s := strings.TrimSpace(os.Getenv(constants.EnvMaxEgressRules))
+	if s == "" {
+		return constants.DefaultMaxEgressRules
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 0 {
+		return constants.DefaultMaxEgressRules
+	}
+	if n == 0 {
+		return 0
+	}
+	return n
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func modeFromPolicy(p *policy.NetworkPolicy) string {
+	if p == nil {
+		return "deny_all"
+	}
+	if p.DefaultAction == policy.ActionAllow && len(p.Egress) == 0 {
+		return "allow_all"
+	} else if p.DefaultAction == policy.ActionDeny && len(p.Egress) == 0 {
+		return "deny_all"
+	}
+
+	return "enforcing"
+}
+
+func policyRuleSummary(p *policy.NetworkPolicy) []map[string]string {
+	if p == nil {
+		return nil
+	}
+	return egressRulesSummary(p.Egress)
+}
+
+func egressRulesSummary(egress []policy.EgressRule) []map[string]string {
+	out := make([]map[string]string, 0, len(egress))
+	for _, r := range egress {
+		out = append(out, map[string]string{
+			"action": r.Action,
+			"target": r.Target,
+		})
+	}
+	return out
+}
+
+func logEgressLoaded(pol *policy.NetworkPolicy) {
+	if pol == nil {
+		pol = policy.DefaultDenyPolicy()
+	}
+	fields := []slogger.Field{
+		{Key: "opensandbox.event", Value: "egress.loaded"},
+		{Key: "egress.default", Value: pol.DefaultAction},
+		{Key: "rules", Value: policyRuleSummary(pol)},
+	}
+	log.Logger.With(fields...).Infof("egress policy loaded")
+}
+
+// logEgressUpdated: egress.updated event. rules is only the delta for this request (PATCH: patch list;
+// POST/PUT: full body egress; reset: empty), defaultAction is the policy after apply.
+func logEgressUpdated(defaultAction string, deltaEgress []policy.EgressRule) {
+	fields := []slogger.Field{
+		{Key: "opensandbox.event", Value: "egress.updated"},
+		{Key: "egress.default", Value: defaultAction},
+		{Key: "rules", Value: egressRulesSummary(deltaEgress)},
+	}
+	log.Logger.With(fields...).Infof("egress policy updated")
+}
+
+func logEgressUpdateFailedWarn(msg string) {
+	fields := []slogger.Field{
+		{Key: "opensandbox.event", Value: "egress.update_failed"},
+		{Key: "error", Value: msg},
+	}
+	log.Logger.With(fields...).Warnf("egress policy update failed")
+}
+
+func logEgressUpdateFailedError(msg string) {
+	fields := []slogger.Field{
+		{Key: "opensandbox.event", Value: "egress.update_failed"},
+		{Key: "error", Value: msg},
+	}
+	log.Logger.With(fields...).Errorf("egress policy update failed")
+}

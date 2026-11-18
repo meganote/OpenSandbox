@@ -1,5 +1,5 @@
 #
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@ T = TypeVar("T", bound="Host")
 
 @_attrs_define
 class Host:
-    """Host path bind mount backend. Maps a directory on the host filesystem
+    r"""Host path bind mount backend. Maps a directory on the host filesystem
     into the container. Only available when the runtime supports host mounts.
 
     Security note: Host paths are restricted by server-side allowlist.
@@ -34,7 +34,8 @@ class Host:
 
         Attributes:
             path (str): Absolute path on the host filesystem to mount.
-                Must start with '/' and be under an allowed prefix.
+                Must start with '/' (Unix) or a drive letter such as 'C:\' or 'D:/'
+                (Windows), and be under an allowed prefix.
     """
 
     path: str

@@ -1,0 +1,193 @@
+# Copyright 2026 The OpenSandbox Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Per-sandbox file-backed metadata store for Docker.
+
+Docker cannot update labels on running containers, so user metadata patches,
+expiration overrides, and lifecycle transitions are persisted to JSON files under
+``~/.opensandbox/metadata/``. Atomic writes (tmp + rename) guard against
+truncation during crash, and one lock serializes every read-modify-write so
+concurrent patches of one sandbox neither fail nor drop each other's keys.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import threading
+from contextlib import suppress
+from datetime import datetime
+from pathlib import Path
+from uuid import uuid4
+
+from opensandbox_server.services.constants import SANDBOX_METADATA_KEYS_LABEL
+
+logger = logging.getLogger(__name__)
+
+_NON_USER_LABEL_PREFIXES = (
+    "opensandbox.io/",
+    "org.opencontainers.image.",
+    "com.docker.",
+    "desktop.docker.",
+)
+
+DEFAULT_STORE_DIR = Path.home() / ".opensandbox" / "metadata"
+
+
+def _is_user_label(key: str) -> bool:
+    return not any(key.startswith(p) for p in _NON_USER_LABEL_PREFIXES)
+
+
+def _extract_user_labels(labels: dict) -> dict:
+    """User metadata stored in container labels.
+
+    Image labels are merged into container labels, so only the keys recorded
+    at create are metadata. Containers created before that label existed fall
+    back to every label without a system prefix.
+    """
+    try:
+        keys = json.loads(labels[SANDBOX_METADATA_KEYS_LABEL])
+    except (KeyError, TypeError, ValueError):
+        keys = None
+    if isinstance(keys, list):
+        return {k: labels[k] for k in keys if isinstance(k, str) and k in labels}
+    return {k: v for k, v in labels.items() if _is_user_label(k)}
+
+
+class DockerMetadataStore:
+    """Per-sandbox file-backed store for metadata, expiration, and transitions."""
+
+    def __init__(self, root: Path | None = None) -> None:
+        self._root = root or DEFAULT_STORE_DIR
+        # Request threads and expiration timers write the same files; the
+        # lock keeps each read-modify-write whole.
+        self._lock = threading.Lock()
+
+    def get(self, sandbox_id: str, container_labels: dict) -> dict | None:
+        """Return effective user metadata for a sandbox.
+
+        If a persisted override file exists, returns that.  Otherwise falls
+        back to extracting user labels from the container.
+        """
+        path = self._sandbox_path(sandbox_id)
+        if path.exists():
+            overrides = self._read_file(path)
+            if overrides is not None:
+                return overrides or None
+        return _extract_user_labels(container_labels) or None
+
+    def patch(
+        self,
+        sandbox_id: str,
+        container_labels: dict,
+        patch: dict,
+    ) -> None:
+        """Apply a JSON Merge Patch to user metadata and persist atomically.
+
+        Callers must validate the patch (reserved keys, label format) before
+        calling this method.
+        """
+        path = self._sandbox_path(sandbox_id)
+
+        with self._lock:
+            # The override file holds the full effective metadata (see get()), so
+            # it replaces the container labels rather than being merged onto them;
+            # merging would resurrect keys removed by an earlier patch.
+            current = self._read_file(path)
+            if not isinstance(current, dict):
+                current = _extract_user_labels(container_labels)
+
+            for key, value in patch.items():
+                if value is None:
+                    current.pop(key, None)
+                else:
+                    current[key] = str(value)
+
+            self._write_file(path, current)
+
+    def get_expiration(self, sandbox_id: str) -> str | None:
+        payload = self._read_file(self._expiration_path(sandbox_id))
+        if not isinstance(payload, dict):
+            return None
+        expires_at = payload.get("expires_at")
+        if isinstance(expires_at, str) and expires_at.strip():
+            return expires_at
+        return None
+
+    def set_expiration(self, sandbox_id: str, expires_at: datetime) -> None:
+        with self._lock:
+            self._write_file(
+                self._expiration_path(sandbox_id),
+                {"expires_at": expires_at.isoformat()},
+            )
+
+    def get_transition_time(self, sandbox_id: str, state: str) -> str | None:
+        payload = self._read_file(self._transition_path(sandbox_id))
+        if not isinstance(payload, dict) or payload.get("state") != state:
+            return None
+        transitioned_at = payload.get("last_transition_at")
+        if isinstance(transitioned_at, str) and transitioned_at.strip():
+            return transitioned_at
+        return None
+
+    def set_transition(self, sandbox_id: str, state: str, transitioned_at: datetime) -> None:
+        with self._lock:
+            self._write_file(
+                self._transition_path(sandbox_id),
+                {"state": state, "last_transition_at": transitioned_at.isoformat()},
+            )
+
+    def delete(self, sandbox_id: str) -> None:
+        with self._lock:
+            for path in (
+                self._sandbox_path(sandbox_id),
+                self._expiration_path(sandbox_id),
+                self._transition_path(sandbox_id),
+            ):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.warning(f"Failed to delete metadata file {path}: {exc}")
+
+    def _sandbox_path(self, sandbox_id: str) -> Path:
+        return self._root / f"{sandbox_id}.json"
+
+    def _expiration_path(self, sandbox_id: str) -> Path:
+        return self._root / "_expiration" / f"{sandbox_id}.json"
+
+    def _transition_path(self, sandbox_id: str) -> Path:
+        return self._root / "_transition" / f"{sandbox_id}.json"
+
+    @staticmethod
+    def _read_file(path: Path) -> dict | None:
+        try:
+            if path.exists():
+                return json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning(f"Failed to read metadata file {path}: {exc}")
+        return None
+
+    @staticmethod
+    def _write_file(path: Path, data: dict) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # A temporary name of its own per write: two writers never race on one.
+        tmp = path.with_name(f"{path.stem}.{uuid4().hex}.tmp")
+        try:
+            tmp.write_text(json.dumps(data))
+            tmp.replace(path)
+        except OSError:
+            # Nothing reuses this name, so a failed write removes its own file.
+            with suppress(OSError):
+                tmp.unlink()
+            raise

@@ -1,0 +1,589 @@
+// Copyright 2025 The OpenSandbox Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//go:build !windows
+// +build !windows
+
+package runtime
+
+import (
+	"bufio"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/alibaba/opensandbox/internal/safego"
+
+	"github.com/alibaba/opensandbox/execd/pkg/binding"
+)
+
+func replayContains(t *testing.T, s *ptySession, substr string, timeout time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		data, _ := s.replay.ReadFrom(0)
+		if strings.Contains(string(data), substr) {
+			return true
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	return false
+}
+
+func TestPTYSession_FallsBackToSh(t *testing.T) {
+	useShOnlyPath(t)
+
+	t.Run("pty", func(t *testing.T) {
+		s := newPTYSession(uuidString(), "", "printf fallback_pty")
+		require.NoError(t, s.StartPTY())
+		t.Cleanup(func() { s.close() })
+
+		require.True(t, replayContains(t, s, "fallback_pty", 5*time.Second),
+			"expected custom command output from sh in PTY mode")
+	})
+
+	t.Run("pipe", func(t *testing.T) {
+		s := newPTYSession(uuidString(), "", "")
+		require.NoError(t, s.StartPipe())
+		t.Cleanup(func() { s.close() })
+
+		stdoutR, _, detach := s.AttachOutput()
+		defer detach()
+		stdoutCh := make(chan string, 1)
+		safego.Go(func() {
+			sc := bufio.NewScanner(stdoutR)
+			for sc.Scan() {
+				stdoutCh <- sc.Text()
+			}
+		})
+
+		_, writeErr := s.WriteStdin([]byte("printf 'fallback_pipe\\n'\nexit\n"))
+		require.NoError(t, writeErr)
+		require.True(t, waitForLine(stdoutCh, "fallback_pipe", 5*time.Second),
+			"expected interactive command output from sh in pipe mode")
+	})
+}
+
+func TestPTYSession_BasicExecution(t *testing.T) {
+	requireBash(t)
+
+	s := newPTYSession(uuidString(), "", "")
+	require.NoError(t, s.StartPTY())
+	t.Cleanup(func() { s.close() })
+
+	stdoutR, _, detach := s.AttachOutput()
+	defer detach()
+	safego.Go(func() { _, _ = io.Copy(io.Discard, stdoutR) }) //nolint:errcheck
+
+	_, err := s.WriteStdin([]byte("echo hello_pty\n"))
+	require.NoError(t, err)
+
+	require.True(t, replayContains(t, s, "hello_pty", 5*time.Second),
+		"expected 'hello_pty' in PTY replay buffer")
+}
+
+func TestPTYSession_OutputDoneAfterPipeReplay(t *testing.T) {
+	requireBash(t)
+
+	s := newPTYSession(uuidString(), "", "printf output_done_marker")
+	require.NoError(t, s.StartPipe())
+	t.Cleanup(func() { s.close() })
+
+	select {
+	case <-s.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("pipe session did not exit")
+	}
+	select {
+	case <-s.OutputDone():
+	case <-time.After(5 * time.Second):
+		t.Fatal("pipe output broadcasters did not finish")
+	}
+
+	data, _ := s.replay.ReadFrom(0)
+	require.Contains(t, string(data), "output_done_marker")
+}
+
+func TestPTYSession_IsRunning(t *testing.T) {
+	requireBash(t)
+
+	s := newPTYSession(uuidString(), "", "")
+	require.False(t, s.IsRunning())
+	require.NoError(t, s.StartPTY())
+	t.Cleanup(func() { s.close() })
+	require.True(t, s.IsRunning())
+}
+
+func TestPTYSession_ResizeWinsize(t *testing.T) {
+	requireBash(t)
+
+	s := newPTYSession(uuidString(), "", "")
+	require.NoError(t, s.StartPTY())
+	t.Cleanup(func() { s.close() })
+
+	// Attach output so the broadcast goroutine has a sink and fills the replay buffer.
+	stdoutR, _, detach := s.AttachOutput()
+	defer detach()
+	safego.Go(func() { _, _ = io.Copy(io.Discard, stdoutR) }) //nolint:errcheck
+
+	// Wait for bash to start (prompt appears).
+	time.Sleep(150 * time.Millisecond)
+
+	require.NoError(t, s.ResizePTY(120, 40))
+
+	// stty size reports "rows cols" (e.g. "40 120").
+	_, err := s.WriteStdin([]byte("stty size\n"))
+	require.NoError(t, err)
+
+	require.True(t, replayContains(t, s, "40 120", 5*time.Second),
+		"expected 'stty size' output '40 120' in replay buffer")
+}
+
+func TestPTYSession_ANSISequences(t *testing.T) {
+	requireBash(t)
+
+	s := newPTYSession(uuidString(), "", "")
+	require.NoError(t, s.StartPTY())
+	t.Cleanup(func() { s.close() })
+
+	stdoutR, _, detach := s.AttachOutput()
+	defer detach()
+	safego.Go(func() { _, _ = io.Copy(io.Discard, stdoutR) }) //nolint:errcheck
+
+	_, err := s.WriteStdin([]byte("printf $'\\033[1;32mGREEN\\033[0m\\n'\n"))
+	require.NoError(t, err)
+
+	// Wait for ESC from printf output. Do not match on "GREEN" alone: the echoed
+	// command line contains that substring before printf runs.
+	require.True(t, replayContains(t, s, "\x1b", 5*time.Second),
+		"expected ESC bytes in PTY replay buffer")
+
+	data, _ := s.replay.ReadFrom(0)
+	assert.Contains(t, string(data), "GREEN", "expected GREEN text in PTY output")
+}
+
+func TestPTYSession_PipeMode(t *testing.T) {
+	requireBash(t)
+
+	s := newPTYSession(uuidString(), "", "")
+	require.NoError(t, s.StartPipe())
+	t.Cleanup(func() { s.close() })
+
+	require.False(t, s.IsPTY())
+
+	stdoutR, stderrR, detach := s.AttachOutput()
+	defer detach()
+	require.NotNil(t, stderrR)
+
+	stdoutCh := make(chan string, 32)
+	safego.Go(func() {
+		sc := bufio.NewScanner(stdoutR)
+		for sc.Scan() {
+			stdoutCh <- sc.Text()
+		}
+	})
+
+	stderrCh := make(chan string, 32)
+	safego.Go(func() {
+		sc := bufio.NewScanner(stderrR)
+		for sc.Scan() {
+			stderrCh <- sc.Text()
+		}
+	})
+
+	_, err := s.WriteStdin([]byte("echo hello_pipe\necho err_pipe >&2\n"))
+	require.NoError(t, err)
+
+	require.True(t, waitForLine(stdoutCh, "hello_pipe", 5*time.Second),
+		"expected 'hello_pipe' on stdout")
+	require.True(t, waitForLine(stderrCh, "err_pipe", 5*time.Second),
+		"expected 'err_pipe' on stderr")
+}
+
+func TestPTYSession_ReconnectReplay(t *testing.T) {
+	requireBash(t)
+
+	s := newPTYSession(uuidString(), "", "")
+	require.NoError(t, s.StartPTY())
+	t.Cleanup(func() { s.close() })
+
+	stdoutR1, _, detach1 := s.AttachOutput()
+	safego.Go(func() { _, _ = io.Copy(io.Discard, stdoutR1) }) //nolint:errcheck
+
+	_, err := s.WriteStdin([]byte("echo first_output\n"))
+	require.NoError(t, err)
+
+	require.True(t, replayContains(t, s, "first_output", 5*time.Second),
+		"expected 'first_output' in replay buffer")
+
+	snapshot, snapshotOff := s.replay.ReadFrom(0)
+	detach1()
+	time.Sleep(50 * time.Millisecond)
+
+	replay, replayOff := s.replay.ReadFrom(0)
+	require.Equal(t, snapshotOff, replayOff)
+	// The new snapshot may be larger (more output arrived), but must contain snapshot.
+	require.True(t, strings.HasPrefix(string(replay), string(snapshot)) || len(replay) >= len(snapshot),
+		"replay should contain at least the original snapshot bytes")
+
+	stdoutR2, _, detach2 := s.AttachOutput()
+	defer detach2()
+	safego.Go(func() { _, _ = io.Copy(io.Discard, stdoutR2) }) //nolint:errcheck
+
+	offsetAfterFirst := int64(len(replay))
+
+	_, err = s.WriteStdin([]byte("echo second_output\n"))
+	require.NoError(t, err)
+
+	require.True(t, replayContains(t, s, "second_output", 5*time.Second),
+		"expected 'second_output' in replay buffer")
+
+	newData, _ := s.replay.ReadFrom(offsetAfterFirst)
+	require.True(t, strings.Contains(string(newData), "second_output"),
+		"delta replay should contain 'second_output', got %q", string(newData))
+}
+
+func TestPTYSession_SendSIGINT(t *testing.T) {
+	requireBash(t)
+
+	s := newPTYSession(uuidString(), "", "")
+	require.NoError(t, s.StartPTY())
+	t.Cleanup(func() { s.close() })
+
+	stdoutR, _, detach := s.AttachOutput()
+	defer detach()
+	safego.Go(func() { _, _ = io.Copy(io.Discard, stdoutR) }) //nolint:errcheck
+
+	_, err := s.WriteStdin([]byte("sleep 30\n"))
+	require.NoError(t, err)
+	time.Sleep(200 * time.Millisecond)
+
+	// SIGINT interrupts the sleep; bash continues.
+	s.SendSignal("SIGINT")
+
+	require.Eventually(t, func() bool {
+		return s.IsRunning()
+	}, 2*time.Second, 50*time.Millisecond, "bash should still be running after SIGINT")
+}
+
+func TestPTYSession_CloseTerminatesProcess(t *testing.T) {
+	requireBash(t)
+
+	s := newPTYSession(uuidString(), "", "")
+	require.NoError(t, s.StartPTY())
+
+	require.True(t, s.IsRunning())
+	s.close()
+
+	done := s.Done()
+	if done != nil {
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("process did not exit within 3s after close()")
+		}
+	}
+}
+
+func TestPTYSession_CloseStopsBackgroundJobs(t *testing.T) {
+	requireBash(t)
+	if _, err := os.Stat("/proc/self/stat"); err != nil {
+		t.Skip("process liveness check needs /proc")
+	}
+
+	s := newPTYSession(uuidString(), "", "")
+	require.NoError(t, s.StartPTY())
+	t.Cleanup(func() { s.close() })
+	stdoutR, _, detach := s.AttachOutput()
+	defer detach()
+	safego.Go(func() { _, _ = io.Copy(io.Discard, stdoutR) }) //nolint:errcheck
+
+	// Job control puts the background job in its own process group.
+	pidFile := filepath.Join(t.TempDir(), "job.pid")
+	_, err := s.WriteStdin([]byte("sleep 300 & echo $! > " + pidFile + "\n"))
+	require.NoError(t, err)
+	var jobPid int
+	require.Eventually(t, func() bool {
+		data, err := os.ReadFile(pidFile)
+		if err != nil {
+			return false
+		}
+		jobPid, err = strconv.Atoi(strings.TrimSpace(string(data)))
+		return err == nil && jobPid > 0
+	}, 5*time.Second, 25*time.Millisecond, "background job did not start")
+
+	started := time.Now()
+	s.close()
+
+	select {
+	case <-s.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("session did not end within 3s after close()")
+	}
+	// The job no longer holds the terminal open until ptyDrainTimeout.
+	assert.Less(t, time.Since(started), ptyDrainTimeout, "session end waited for the output drain timeout")
+	assert.Eventually(t, func() bool { return processGone(jobPid) }, 3*time.Second, 25*time.Millisecond,
+		"background job %d survived close()", jobPid)
+}
+
+// processGone reports whether pid no longer exists or is a zombie.
+func processGone(pid int) bool {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return true
+	}
+	// The state follows the parenthesised command name.
+	fields := strings.Fields(string(data[strings.LastIndexByte(string(data), ')')+1:]))
+	return len(fields) > 0 && fields[0] == "Z"
+}
+
+func TestPTYSession_ExitCode(t *testing.T) {
+	requireBash(t)
+
+	s := newPTYSession(uuidString(), "", "")
+	require.NoError(t, s.StartPTY())
+
+	stdoutR, _, detach := s.AttachOutput()
+	safego.Go(func() { _, _ = io.Copy(io.Discard, stdoutR) }) //nolint:errcheck
+
+	_, _ = s.WriteStdin([]byte("exit 42\n"))
+
+	done := s.Done()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		detach()
+		t.Fatal("bash did not exit within 5s")
+	}
+	detach()
+
+	require.Equal(t, 42, s.ExitCode())
+}
+
+func TestPTYSession_LockWS(t *testing.T) {
+	s := newPTYSession(uuidString(), "", "")
+	require.True(t, s.LockWS(), "first lock should succeed")
+	require.False(t, s.LockWS(), "second lock should fail")
+	s.UnlockWS()
+	require.True(t, s.LockWS(), "lock after unlock should succeed")
+	s.UnlockWS()
+}
+
+func TestPTYSession_CustomCommand(t *testing.T) {
+	requireBash(t)
+
+	s := newPTYSession(uuidString(), "", "echo hello_command")
+	require.NoError(t, s.StartPipe())
+	t.Cleanup(func() { s.close() })
+
+	stdoutR, stderrR, detach := s.AttachOutput()
+	defer detach()
+	require.NotNil(t, stderrR)
+
+	stdoutCh := make(chan string, 32)
+	safego.Go(func() {
+		sc := bufio.NewScanner(stdoutR)
+		for sc.Scan() {
+			stdoutCh <- sc.Text()
+		}
+	})
+
+	require.True(t, waitForLine(stdoutCh, "hello_command", 5*time.Second),
+		"expected 'hello_command' from custom command on stdout")
+
+	require.Eventually(t, func() bool {
+		return !s.IsRunning()
+	}, 3*time.Second, 50*time.Millisecond, "session should exit after custom command completes")
+}
+
+func TestPTYSession_ControllerCRUD(t *testing.T) {
+	c := NewController("", "")
+	id := uuidString()
+
+	sess, _ := c.CreatePTYSession(id, "", "")
+	require.NotNil(t, sess)
+
+	got := c.GetPTYSession(id)
+	require.NotNil(t, got)
+	require.Equal(t, id, got.(*ptySession).id)
+
+	running, offset, err := c.GetPTYSessionStatus(id)
+	require.NoError(t, err)
+	require.False(t, running)
+	require.Equal(t, int64(0), offset)
+
+	require.NoError(t, c.DeletePTYSession(id))
+	require.Nil(t, c.GetPTYSession(id))
+
+	require.ErrorIs(t, c.DeletePTYSession(id), ErrContextNotFound)
+}
+
+func waitForLine(ch <-chan string, target string, timeout time.Duration) bool {
+	deadline := time.After(timeout)
+	for {
+		select {
+		case line := <-ch:
+			if strings.Contains(line, target) {
+				return true
+			}
+		case <-deadline:
+			return false
+		}
+	}
+}
+
+func TestPTYSessionEnvDefaultsTerm(t *testing.T) {
+	t.Setenv("EXECD_ENVS", "")
+	applyTestBinding(t, &binding.RuntimeBinding{SandboxID: "sandbox-1"})
+
+	t.Setenv("TERM", "")
+	require.Equal(
+		t,
+		[]string{"TERM=" + defaultPTYTerm},
+		terminalEntries(ptySessionEnv()),
+	)
+}
+
+func TestPTYSessionEnvKeepsExistingTerm(t *testing.T) {
+	t.Setenv("EXECD_ENVS", "")
+	applyTestBinding(t, &binding.RuntimeBinding{SandboxID: "sandbox-1"})
+
+	t.Setenv("TERM", "xterm")
+	require.Equal(t, []string{"TERM=xterm"}, terminalEntries(ptySessionEnv()))
+}
+
+func terminalEntries(env []string) []string {
+	var found []string
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "TERM=") {
+			found = append(found, kv)
+		}
+	}
+	return found
+}
+
+// When the shell exits, the PTY master still holds output the reader has not
+// consumed yet, e.g. because the attached client reads slowly. That output
+// must still reach the replay buffer.
+func TestPTYSession_KeepsOutputBufferedWhenShellExits(t *testing.T) {
+	requireBash(t)
+
+	const outputBytes = 600000
+	s := newPTYSession(uuidString(), "", "head -c 600000 /dev/zero | tr '\\0' a; printf END")
+	require.NoError(t, s.StartPTY())
+	t.Cleanup(func() { s.close() })
+
+	stdoutR, _, detach := s.AttachOutput()
+	defer detach()
+	safego.Go(func() {
+		buf := make([]byte, 4096)
+		for {
+			if _, err := stdoutR.Read(buf); err != nil {
+				return
+			}
+			time.Sleep(200 * time.Microsecond)
+		}
+	})
+
+	select {
+	case <-s.OutputDone():
+	case <-time.After(30 * time.Second):
+		t.Fatal("PTY output was not drained")
+	}
+	data, _ := s.replay.ReadFrom(0)
+	require.Equal(t, outputBytes+len("END"), len(data))
+	require.True(t, strings.HasSuffix(string(data), "END"))
+}
+
+// A client that is attached but stopped reading blocks the broadcast
+// goroutine; the session must still end once the shell exits.
+func TestPTYSession_EndsWhileClientStopsReading(t *testing.T) {
+	requireBash(t)
+
+	s := newPTYSession(uuidString(), "", "echo started")
+	require.NoError(t, s.StartPTY())
+	t.Cleanup(func() { s.close() })
+	_, _, detach := s.AttachOutput()
+	defer detach()
+
+	select {
+	case <-s.Done():
+	case <-time.After(ptyDrainTimeout + 5*time.Second):
+		t.Fatal("session did not end after the shell exited")
+	}
+}
+
+// The shell is reaped before its output is drained, so its PID may be reused
+// meanwhile: the session must stop signalling it right away.
+func TestPTYSession_StopsSignallingOnceShellIsReaped(t *testing.T) {
+	requireBash(t)
+
+	s := newPTYSession(uuidString(), "", "echo started")
+	require.NoError(t, s.StartPTY())
+	t.Cleanup(func() { s.close() })
+	_, _, detach := s.AttachOutput()
+	defer detach()
+
+	require.Eventually(t, func() bool { return !s.IsRunning() },
+		ptyDrainTimeout/2, 10*time.Millisecond,
+		"session still signalable while its output drains")
+}
+
+// Input that arrives after the shell is reaped, while its output drains, is
+// dropped as a terminal would, rather than failing the client's stdin write.
+func TestPTYSession_DropsStdinOnceShellIsReaped(t *testing.T) {
+	requireBash(t)
+
+	s := newPTYSession(uuidString(), "", "echo started")
+	require.NoError(t, s.StartPTY())
+	t.Cleanup(func() { s.close() })
+	_, _, detach := s.AttachOutput()
+	defer detach()
+
+	require.Eventually(t, func() bool { return !s.IsRunning() },
+		ptyDrainTimeout/2, 10*time.Millisecond)
+	select {
+	case <-s.Done():
+		t.Fatal("session ended before its output drained")
+	default:
+	}
+
+	// More than the tty input queue holds, so a write that reached the master
+	// would block until the drain ends and then fail.
+	line := []byte(strings.Repeat("a", 1023) + "\n")
+	written := make(chan error, 1)
+	safego.Go(func() {
+		for range 64 {
+			if _, err := s.WriteStdin(line); err != nil {
+				written <- err
+				return
+			}
+		}
+		written <- nil
+	})
+	select {
+	case err := <-written:
+		require.NoError(t, err)
+	case <-time.After(ptyDrainTimeout / 2):
+		t.Fatal("stdin write blocked while the output drained")
+	}
+}

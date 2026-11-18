@@ -1,5 +1,5 @@
 #
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -50,18 +50,18 @@ class Volume:
                 Security note: Host paths are restricted by server-side allowlist.
                 Users must specify paths under permitted prefixes.
             pvc (PVC | Unset): Platform-managed named volume backend. A runtime-neutral abstraction
-                for referencing a pre-existing, platform-managed named volume.
+                for referencing a platform-managed named volume. If `createIfNotExists`
+                is true (the default) and the volume does not yet exist, it will be
+                created automatically using the provisioning hints below.
 
                 - Kubernetes: maps to a PersistentVolumeClaim in the same namespace.
                 - Docker: maps to a Docker named volume (created via `docker volume create`).
-
-                The volume must already exist on the target platform before sandbox
-                creation.
             ossfs (OSSFS | Unset): Alibaba Cloud OSS mount backend via ossfs.
 
                 The runtime mounts a host-side OSS path under `storage.ossfs_mount_root`
                 and bind-mounts the resolved path into the sandbox container.
                 Prefix selection is expressed via `Volume.subPath`.
+                In Docker runtime, OSSFS backend requires OpenSandbox Server to run on a Linux host with FUSE support.
             read_only (bool | Unset): If true, the volume is mounted as read-only. Defaults to false (read-write).
                  Default: False.
             sub_path (str | Unset): Optional subdirectory under the backend path to mount.

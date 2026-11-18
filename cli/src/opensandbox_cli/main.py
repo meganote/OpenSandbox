@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,27 +16,92 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import click
+from rich.console import Console
 
 from opensandbox_cli import __version__
 from opensandbox_cli.client import ClientContext
-from opensandbox_cli.commands.code import code_group
-from opensandbox_cli.commands.command import command_group, exec_cmd
+from opensandbox_cli.commands.command import command_group
 from opensandbox_cli.commands.config_cmd import config_group
+from opensandbox_cli.commands.credential_vault import credential_vault_group
+from opensandbox_cli.commands.diagnostics import diagnostics_group
+from opensandbox_cli.commands.egress import egress_group
 from opensandbox_cli.commands.file import file_group
 from opensandbox_cli.commands.sandbox import sandbox_group
-from opensandbox_cli.config import resolve_config
-from opensandbox_cli.output import OutputFormatter
+from opensandbox_cli.commands.skills import skills_group
+from opensandbox_cli.commands.snapshot import snapshot_group
+from opensandbox_cli.commands.template import template_group
+from opensandbox_cli.commands.terminal import terminal
+from opensandbox_cli.config import _request_timeout_seconds, resolve_config
+
+BANNER = r"""[bold cyan]
+   ____                   _____                 _ _
+  / __ \                 / ____|               | | |
+ | |  | |_ __   ___ _ _| (___   __ _ _ __   __| | |__   _____  __
+ | |  | | '_ \ / _ \ '_ \___ \ / _` | '_ \ / _` | '_ \ / _ \ \/ /
+ | |__| | |_) |  __/ | | |___) | (_| | | | | (_| | |_) | (_) >  <
+  \____/| .__/ \___|_| |_|____/ \__,_|_| |_|\__,_|_.__/ \___/_/\_\
+        | |
+        |_|[/]  [dim]v{version}[/]
+"""
 
 
-@click.group(context_settings={"help_option_names": ["-h", "--help"]})
+# A representative icon: encodings that cannot render it raise on output.
+_OUTPUT_PROBE = "\u2705"
+
+
+def _configure_output_streams() -> None:
+    """Escape unencodable output instead of raising UnicodeEncodeError.
+
+    Click and Rich print emoji and box-drawing characters that legacy code
+    pages (cp936, cp1252, ...) and POSIX ``C`` locales cannot represent.
+    ``backslashreplace`` keeps payload and machine-readable output recoverable;
+    ``errors="replace"`` would silently corrupt them into ``?``.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        encoding = getattr(stream, "encoding", None)
+        if reconfigure is None or encoding is None:
+            continue
+        try:
+            _OUTPUT_PROBE.encode(encoding)
+        except (LookupError, UnicodeEncodeError):
+            try:
+                reconfigure(errors="backslashreplace")
+            except (OSError, ValueError):  # pragma: no cover - detached stream
+                pass
+
+
+class BannerGroup(click.Group):
+    """Custom Click group that shows a banner before help text."""
+
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        """Configure output streams before Click renders help or runs a command."""
+        _configure_output_streams()
+        return super().parse_args(ctx, args)
+
+    def format_help(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
+        console = Console(stderr=False)
+        console.print(BANNER.format(version=__version__))
+        super().format_help(ctx, formatter)
+
+
+@click.group(cls=BannerGroup, context_settings={"help_option_names": ["-h", "--help"]})
 @click.option("--api-key", envvar="OPEN_SANDBOX_API_KEY", default=None, help="API key for authentication.")
 @click.option("--domain", envvar="OPEN_SANDBOX_DOMAIN", default=None, help="API server domain (e.g. localhost:8080).")
 @click.option("--protocol", type=click.Choice(["http", "https"]), default=None, help="Protocol (http/https).")
-@click.option("--timeout", "request_timeout", type=int, default=None, help="Request timeout in seconds.")
-@click.option("-o", "--output", "output_format", type=click.Choice(["table", "json", "yaml"]), default=None, help="Output format.")
+@click.option("--request-timeout", type=int, default=None, help="Request timeout in seconds.")
+@click.option(
+    "--use-server-proxy/--no-use-server-proxy",
+    default=None,
+    help=(
+        "DEPRECATED: the server proxy is in maintenance mode (security/bugfix only); "
+        "route data-plane traffic through the ingress gateway instead."
+    ),
+)
 @click.option("--config", "config_path", type=click.Path(exists=False, path_type=Path), default=None, help="Config file path.")
 @click.option("-v", "--verbose", is_flag=True, default=False, help="Enable verbose/debug output.")
 @click.option("--no-color", is_flag=True, default=False, help="Disable colored output.")
@@ -48,7 +113,7 @@ def cli(
     domain: str | None,
     protocol: str | None,
     request_timeout: int | None,
-    output_format: str | None,
+    use_server_proxy: bool | None,
     config_path: Path | None,
     verbose: bool,
     no_color: bool,
@@ -59,28 +124,61 @@ def cli(
 
         logging.basicConfig(level=logging.DEBUG)
 
-    resolved = resolve_config(
-        cli_api_key=api_key,
-        cli_domain=domain,
-        cli_protocol=protocol,
-        cli_timeout=request_timeout,
-        cli_output=output_format,
-        config_path=config_path,
-    )
+    cli_overrides = {
+        "api_key": api_key,
+        "domain": domain,
+        "protocol": protocol,
+        "request_timeout": request_timeout,
+        "use_server_proxy": use_server_proxy,
+    }
 
-    formatter = OutputFormatter(
-        resolved["output_format"],
-        color=not no_color and resolved.get("color", True),
-    )
+    if ctx.invoked_subcommand == "config":
+        resolved = {
+            "api_key": api_key,
+            "domain": domain,
+            "protocol": protocol or "http",
+            "request_timeout": _request_timeout_seconds(request_timeout),
+            "use_server_proxy": use_server_proxy if use_server_proxy is not None else False,
+            "color": True,
+            "default_image": None,
+            "default_timeout": None,
+        }
+    else:
+        resolved = resolve_config(
+            cli_api_key=api_key,
+            cli_domain=domain,
+            cli_protocol=protocol,
+            cli_timeout=request_timeout,
+            cli_use_server_proxy=use_server_proxy,
+            config_path=config_path,
+        )
+    resolved["color"] = not no_color and resolved.get("color", True)
 
-    ctx.obj = ClientContext(resolved_config=resolved, output=formatter)
+    if ctx.invoked_subcommand != "config" and resolved.get("use_server_proxy"):
+        click.echo(
+            "Warning: connection.use_server_proxy is deprecated: the server proxy "
+            "data path is in maintenance mode (security and bug fixes only); route "
+            "data-plane traffic through the ingress gateway instead.",
+            err=True,
+        )
+
+    effective_config_path = config_path or Path.home() / ".opensandbox" / "config.toml"
+    ctx.obj = ClientContext(
+        resolved_config=resolved,
+        config_path=effective_config_path,
+        cli_overrides=cli_overrides,
+    )
     ctx.call_on_close(lambda: ctx.obj.close())
 
 
-# Register sub-command groups
 cli.add_command(sandbox_group)
+cli.add_command(template_group)
+cli.add_command(snapshot_group)
 cli.add_command(command_group)
-cli.add_command(exec_cmd)
+cli.add_command(terminal)
 cli.add_command(file_group)
-cli.add_command(code_group)
+cli.add_command(egress_group)
+cli.add_command(credential_vault_group)
 cli.add_command(config_group)
+cli.add_command(diagnostics_group)
+cli.add_command(skills_group)

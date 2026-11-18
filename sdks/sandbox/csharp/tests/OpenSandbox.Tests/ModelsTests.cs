@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+using System.Text.Json;
 using FluentAssertions;
 using OpenSandbox.Models;
 using Xunit;
@@ -20,6 +21,117 @@ namespace OpenSandbox.Tests;
 
 public class ModelsTests
 {
+    [Theory]
+    [InlineData("{\"type\":\"execution_complete\",\"exit_code\":0}", 0)]
+    [InlineData("{\"type\":\"execution_complete\"}", null)]
+    public void ServerStreamEvent_ShouldPreserveOptionalZeroExitCode(string json, int? expected)
+    {
+        var streamEvent = JsonSerializer.Deserialize<ServerStreamEvent>(json)!;
+        streamEvent.ExitCode.Should().Be(expected);
+
+        using var serialized = JsonDocument.Parse(JsonSerializer.Serialize(streamEvent));
+        if (expected.HasValue)
+        {
+            serialized.RootElement.GetProperty("exit_code").GetInt32().Should().Be(0);
+        }
+        else
+        {
+            serialized.RootElement.TryGetProperty("exit_code", out _).Should().BeFalse();
+        }
+    }
+
+    [Fact]
+    public void RenewalPolicy_ShouldAcceptBoundaries()
+    {
+        var act300 = () => new RenewalPolicy { ExtendSeconds = 300 }.Validate();
+        act300.Should().NotThrow();
+        var act86400 = () => new RenewalPolicy { ExtendSeconds = 86400 }.Validate();
+        act86400.Should().NotThrow();
+    }
+
+    [Fact]
+    public void RenewalPolicy_ShouldRejectOutOfRange()
+    {
+        var actLow = () => new RenewalPolicy { ExtendSeconds = 299 }.Validate();
+        actLow.Should().Throw<ArgumentOutOfRangeException>();
+        var actHigh = () => new RenewalPolicy { ExtendSeconds = 86401 }.Validate();
+        actHigh.Should().Throw<ArgumentOutOfRangeException>();
+    }
+
+    [Fact]
+    public void SandboxLifecycle_ShouldSerializeRenewalPolicyWithWireNames()
+    {
+        // Catches a JsonPropertyName typo on lifecycle.renewalPolicy.extendSeconds.
+        var lifecycle = new SandboxLifecycle
+        {
+            RenewalPolicy = new RenewalPolicy { ExtendSeconds = 3600 }
+        };
+
+        string json = JsonSerializer.Serialize(lifecycle);
+
+        using var doc = JsonDocument.Parse(json);
+        doc.RootElement
+            .GetProperty("renewalPolicy")
+            .GetProperty("extendSeconds")
+            .GetInt32()
+            .Should().Be(3600);
+    }
+
+    [Fact]
+    public void IsolatedCapabilities_ShouldDeserializeModeAvailability()
+    {
+        const string json = """
+        {
+          "available": true,
+          "setpriv_available": false,
+          "userns_available": true,
+          "commit_supported": false,
+          "diff_supported": false
+        }
+        """;
+
+        var capabilities = JsonSerializer.Deserialize<IsolatedCapabilities>(json);
+
+        capabilities.Should().NotBeNull();
+        capabilities!.SetprivAvailable.Should().BeFalse();
+        capabilities.UsernsAvailable.Should().BeTrue();
+    }
+
+    [Fact]
+    public void IsolatedCapabilities_ShouldPreserveExistingPositionalArguments()
+    {
+        var capabilities = new IsolatedCapabilities(true, null, null, null, true, true);
+
+        capabilities.CommitSupported.Should().BeTrue();
+        capabilities.DiffSupported.Should().BeTrue();
+        capabilities.SetprivAvailable.Should().BeFalse();
+        capabilities.UsernsAvailable.Should().BeFalse();
+    }
+
+    [Fact]
+    public void IsolatedCapabilities_ShouldPreserveExistingSixValueDeconstruction()
+    {
+        var capabilities = new IsolatedCapabilities(
+            true,
+            "bwrap",
+            "0.11.0",
+            "available",
+            true,
+            false,
+            true,
+            true
+        );
+
+        var (available, isolator, version, message, commitSupported, diffSupported) = capabilities;
+
+        available.Should().BeTrue();
+        isolator.Should().Be("bwrap");
+        version.Should().Be("0.11.0");
+        message.Should().Be("available");
+        commitSupported.Should().BeTrue();
+        diffSupported.Should().BeFalse();
+    }
+
     [Fact]
     public void Execution_ShouldInitializeWithEmptyCollections()
     {
@@ -35,6 +147,7 @@ public class ModelsTests
         execution.Results.Should().BeEmpty();
         execution.Error.Should().BeNull();
         execution.Complete.Should().BeNull();
+        execution.ExitCode.Should().BeNull();
     }
 
     [Fact]
@@ -133,6 +246,7 @@ public class ModelsTests
         {
             Id = "sandbox-123",
             Image = new ImageSpec { Uri = "ubuntu:latest" },
+            Platform = new PlatformSpec { Os = "linux", Arch = "amd64" },
             Entrypoint = new List<string> { "tail", "-f", "/dev/null" },
             Status = new SandboxStatus { State = "Running" },
             CreatedAt = DateTime.UtcNow,
@@ -143,9 +257,26 @@ public class ModelsTests
         // Assert
         info.Id.Should().Be("sandbox-123");
         info.Image.Uri.Should().Be("ubuntu:latest");
+        info.Platform.Should().NotBeNull();
+        info.Platform!.Os.Should().Be("linux");
         info.Entrypoint.Should().HaveCount(3);
         info.Status.State.Should().Be("Running");
         info.Metadata.Should().ContainKey("key");
+    }
+
+    [Fact]
+    public void AllocationSummary_ShouldStorePoolAllocation()
+    {
+        var allocation = new AllocationSummary
+        {
+            Mode = "pool",
+            PoolRef = "default/python",
+            State = "allocated"
+        };
+
+        allocation.Mode.Should().Be("pool");
+        allocation.PoolRef.Should().Be("default/python");
+        allocation.State.Should().Be("allocated");
     }
 
     [Fact]
@@ -205,6 +336,45 @@ public class ModelsTests
         policy.Egress.Should().HaveCount(2);
         policy.Egress![0].Action.Should().Be(NetworkRuleAction.Allow);
         policy.Egress[0].Target.Should().Be("example.com");
+    }
+
+    [Fact]
+    public void Volume_WithOssfs_ShouldSerializeExpectedPayload()
+    {
+        var request = new CreateSandboxRequest
+        {
+            Image = new ImageSpec { Uri = "python:3.11" },
+            ResourceLimits = new Dictionary<string, string>(),
+            Entrypoint = new List<string> { "python" },
+            Platform = new PlatformSpec { Os = "linux", Arch = "arm64" },
+            Volumes = new List<Volume>
+            {
+                new()
+                {
+                    Name = "oss-data",
+                    MountPath = "/mnt/oss",
+                    SubPath = "prefix",
+                    Ossfs = new OSSFS
+                    {
+                        Bucket = "bucket-a",
+                        Endpoint = "oss-cn-hangzhou.aliyuncs.com",
+                        AccessKeyId = "ak",
+                        AccessKeySecret = "sk",
+                        Options = new List<string> { "allow_other" }
+                    }
+                }
+            }
+        };
+
+        string json = JsonSerializer.Serialize(request);
+
+        json.Should().Contain("\"ossfs\":");
+        json.Should().Contain("\"bucket\":\"bucket-a\"");
+        json.Should().Contain("\"endpoint\":\"oss-cn-hangzhou.aliyuncs.com\"");
+        json.Should().Contain("\"accessKeyId\":\"ak\"");
+        json.Should().Contain("\"accessKeySecret\":\"sk\"");
+        json.Should().Contain("\"version\":\"2.0\"");
+        json.Should().Contain("\"platform\":{\"os\":\"linux\",\"arch\":\"arm64\"}");
     }
 
     [Fact]
@@ -323,6 +493,53 @@ public class ModelsTests
         options.Uid.Should().Be(1000);
         options.Gid.Should().Be(1000);
         options.Envs.Should().ContainKey("APP_ENV");
+    }
+
+    [Fact]
+    public void CreateIsolatedSessionRequest_ShouldRoundTripUidAboveInt32Max()
+    {
+        // Spec declares uid/gid as uint32; values above Int32.MaxValue must not fail.
+        const long uidAboveInt32 = 3_000_000_000L;
+        const long gidAboveInt32 = 4_000_000_000L;
+        var request = new CreateIsolatedSessionRequest(
+            Workspace: new IsolatedWorkspaceSpec("/workspace"),
+            Uid: uidAboveInt32,
+            Gid: gidAboveInt32
+        );
+
+        var json = JsonSerializer.Serialize(request);
+        var restored = JsonSerializer.Deserialize<CreateIsolatedSessionRequest>(json);
+
+        restored.Should().NotBeNull();
+        restored!.Uid.Should().Be(uidAboveInt32);
+        restored.Gid.Should().Be(gidAboveInt32);
+        using var doc = JsonDocument.Parse(json);
+        doc.RootElement.GetProperty("uid").GetInt64().Should().Be(uidAboveInt32);
+        doc.RootElement.GetProperty("gid").GetInt64().Should().Be(gidAboveInt32);
+    }
+
+    [Fact]
+    public void CreateSessionOptions_ShouldStoreWorkingDirectory()
+    {
+        var options = new CreateSessionOptions
+        {
+            WorkingDirectory = "/workspace"
+        };
+
+        options.WorkingDirectory.Should().Be("/workspace");
+    }
+
+    [Fact]
+    public void RunInSessionOptions_ShouldStoreProperties()
+    {
+        var options = new RunInSessionOptions
+        {
+            WorkingDirectory = "/workspace",
+            TimeoutSeconds = 5
+        };
+
+        options.WorkingDirectory.Should().Be("/workspace");
+        options.TimeoutSeconds.Should().Be(5);
     }
 
     [Fact]

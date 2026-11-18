@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"sync"
 
 	"github.com/gin-gonic/gin"
 
@@ -25,7 +26,11 @@ import (
 )
 
 type basicController struct {
-	ctx *gin.Context
+	ctx          *gin.Context
+	sseSetupOnce sync.Once
+	chunkWriter  sync.Mutex
+	// Assigned once before all command callbacks/goroutines; immutable thereafter.
+	commandID string
 }
 
 func newBasicController(ctx *gin.Context) *basicController {

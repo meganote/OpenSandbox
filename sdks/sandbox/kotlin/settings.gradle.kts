@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Alibaba Group Holding Ltd.
+ * Copyright 2025 The OpenSandbox Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,3 +23,5 @@ plugins {
 include(":sandbox")
 include(":sandbox-api")
 include(":sandbox-bom")
+include(":sandbox-pool-redis")
+include(":code-interpreter")

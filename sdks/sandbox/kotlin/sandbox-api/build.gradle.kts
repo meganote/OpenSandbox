@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Alibaba Group Holding Ltd.
+ * Copyright 2025 The OpenSandbox Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,12 +26,26 @@ repositories {
 
 dependencies {
     implementation(libs.okhttp)
-    implementation(libs.bundles.serialization)
+    compileOnly(libs.bundles.serialization)
+    "shadow"(libs.bundles.serialization)
+}
+
+tasks.named<com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar>("shadowJar") {
+    configurations = listOf(project.configurations.getByName("shadow"))
+    dependencies {
+        include(dependency("org.jetbrains.kotlinx:.*:.*"))
+    }
 }
 
 fun GenerateTask.configureCommonOptions() {
+    outputs.doNotCacheIf("OpenAPI generation must reflect the current spec files") { true }
+
     generatorName.set("kotlin")
     library.set("jvm-okhttp4")
+
+    templateDir.set(
+        project.projectDir.resolve("openapi-templates").absolutePath,
+    )
 
     typeMappings.set(
         mapOf(
@@ -77,7 +91,7 @@ val generateSandboxLifecycleApi =
 
         inputSpec.set(
             rootProject.projectDir.parentFile.parentFile.parentFile
-                .resolve("specs/sandbox-lifecycle.yml").absolutePath,
+                .resolve("specs/sandbox-lifecycle.yml").toURI().toString(),
         )
         outputDir.set(layout.buildDirectory.dir("generated/api/lifecycle").get().asFile.absolutePath)
         packageName.set("com.alibaba.opensandbox.sandbox.api")
@@ -89,17 +103,41 @@ val generateExecdApi =
     tasks.register<GenerateTask>("generateExecdApi") {
         configureCommonOptions()
 
-        inputSpec.set(rootProject.projectDir.parentFile.parentFile.parentFile.resolve("specs/execd-api.yaml").absolutePath)
+        inputSpec.set(rootProject.projectDir.parentFile.parentFile.parentFile.resolve("specs/execd-api.yaml").toURI().toString())
         outputDir.set(layout.buildDirectory.dir("generated/api/execd").get().asFile.absolutePath)
         packageName.set("com.alibaba.opensandbox.sandbox.api.execd")
         apiPackage.set("com.alibaba.opensandbox.sandbox.api.execd")
         modelPackage.set("com.alibaba.opensandbox.sandbox.api.models.execd")
     }
 
+val generateEgressApi =
+    tasks.register<GenerateTask>("generateEgressApi") {
+        configureCommonOptions()
+
+        inputSpec.set(rootProject.projectDir.parentFile.parentFile.parentFile.resolve("specs/egress-api.yaml").toURI().toString())
+        outputDir.set(layout.buildDirectory.dir("generated/api/egress").get().asFile.absolutePath)
+        packageName.set("com.alibaba.opensandbox.sandbox.api.egress")
+        apiPackage.set("com.alibaba.opensandbox.sandbox.api.egress")
+        modelPackage.set("com.alibaba.opensandbox.sandbox.api.models.egress")
+    }
+
+val generateDiagnosticApi =
+    tasks.register<GenerateTask>("generateDiagnosticApi") {
+        configureCommonOptions()
+
+        inputSpec.set(rootProject.projectDir.parentFile.parentFile.parentFile.resolve("specs/diagnostic-api.yml").toURI().toString())
+        outputDir.set(layout.buildDirectory.dir("generated/api/diagnostic").get().asFile.absolutePath)
+        packageName.set("com.alibaba.opensandbox.sandbox.api.diagnostic")
+        apiPackage.set("com.alibaba.opensandbox.sandbox.api.diagnostic")
+        modelPackage.set("com.alibaba.opensandbox.sandbox.api.models.diagnostic")
+    }
+
 val lifecycleSrc = generateSandboxLifecycleApi.map { file(it.outputDir).resolve("src/main/kotlin") }
 val execdSrc = generateExecdApi.map { file(it.outputDir).resolve("src/main/kotlin") }
+val egressSrc = generateEgressApi.map { file(it.outputDir).resolve("src/main/kotlin") }
+val diagnosticSrc = generateDiagnosticApi.map { file(it.outputDir).resolve("src/main/kotlin") }
 sourceSets {
     main {
-        java.srcDirs(lifecycleSrc, execdSrc)
+        java.srcDirs(lifecycleSrc, execdSrc, egressSrc, diagnosticSrc)
     }
 }

@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,22 +18,25 @@
 package controller
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"os"
-	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/alibaba/opensandbox/execd/pkg/util/glob"
+	"github.com/alibaba/opensandbox/execd/pkg/util/pathutil"
 	"github.com/alibaba/opensandbox/execd/pkg/web/model"
 )
 
-// FilesystemController handles file system operations
+// TODO: migrate FilesystemController to use vfs.FS interface,
+// unifying the filesystem backend with IsolatedSessionController's file handlers.
+
 type FilesystemController struct {
 	*basicController
 }
@@ -43,7 +46,7 @@ func NewFilesystemController(ctx *gin.Context) *FilesystemController {
 }
 
 func (c *FilesystemController) handleFileError(err error) {
-	if os.IsNotExist(err) {
+	if errors.Is(err, fs.ErrNotExist) {
 		c.RespondError(
 			http.StatusNotFound,
 			model.ErrorCodeFileNotFound,
@@ -58,16 +61,23 @@ func (c *FilesystemController) handleFileError(err error) {
 	}
 }
 
-// GetFilesInfo retrieves metadata for specified file paths
 func (c *FilesystemController) GetFilesInfo() {
+	rec := beginFilesystemMetric("info")
+	defer rec.Finish(c.basicController)
+
 	paths := c.ctx.QueryArray("path")
 	if len(paths) == 0 {
+		rec.MarkSuccess()
 		c.RespondSuccess(make(map[string]model.FileInfo))
 		return
 	}
 
 	resp := make(map[string]model.FileInfo)
 	for _, filePath := range paths {
+		if err := rejectStagingPath(filePath); err != nil {
+			c.handleFileError(err)
+			return
+		}
 		fileInfo, err := GetFileInfo(filePath)
 		if err != nil {
 			c.handleFileError(err)
@@ -76,13 +86,20 @@ func (c *FilesystemController) GetFilesInfo() {
 		resp[filePath] = fileInfo
 	}
 
+	rec.MarkSuccess()
 	c.RespondSuccess(resp)
 }
 
-// RemoveFiles deletes specified files
 func (c *FilesystemController) RemoveFiles() {
+	rec := beginFilesystemMetric("delete")
+	defer rec.Finish(c.basicController)
+
 	paths := c.ctx.QueryArray("path")
 	for _, filePath := range paths {
+		if err := rejectStagingPath(filePath); err != nil {
+			c.handleFileError(err)
+			return
+		}
 		if err := DeleteFile(filePath); err != nil {
 			c.RespondError(
 				http.StatusInternalServerError,
@@ -93,11 +110,14 @@ func (c *FilesystemController) RemoveFiles() {
 		}
 	}
 
+	rec.MarkSuccess()
 	c.RespondSuccess(nil)
 }
 
-// ChmodFiles changes file permissions for specified files
 func (c *FilesystemController) ChmodFiles() {
+	rec := beginFilesystemMetric("chmod")
+	defer rec.Finish(c.basicController)
+
 	var request map[string]model.Permission
 	if err := c.bindJSON(&request); err != nil {
 		c.RespondError(
@@ -109,6 +129,10 @@ func (c *FilesystemController) ChmodFiles() {
 	}
 
 	for file, item := range request {
+		if err := rejectStagingPath(file); err != nil {
+			c.handleFileError(err)
+			return
+		}
 		err := ChmodFile(file, item)
 		if err != nil {
 			c.RespondError(
@@ -120,11 +144,14 @@ func (c *FilesystemController) ChmodFiles() {
 		}
 	}
 
+	rec.MarkSuccess()
 	c.RespondSuccess(nil)
 }
 
-// RenameFiles renames or moves files to new paths
 func (c *FilesystemController) RenameFiles() {
+	rec := beginFilesystemMetric("rename")
+	defer rec.Finish(c.basicController)
+
 	var request []model.RenameFileItem
 	if err := c.bindJSON(&request); err != nil {
 		c.RespondError(
@@ -135,18 +162,34 @@ func (c *FilesystemController) RenameFiles() {
 		return
 	}
 
+	if err := validateExpandedRenameFiles(request); err != nil {
+		c.RespondError(http.StatusBadRequest, model.ErrorCodeInvalidRequest, err.Error())
+		return
+	}
+
 	for _, renameItem := range request {
+		if err := rejectStagingPath(renameItem.Src); err != nil {
+			c.handleFileError(err)
+			return
+		}
+		if err := rejectStagingPath(renameItem.Dest); err != nil {
+			c.handleFileError(err)
+			return
+		}
 		if err := RenameFile(renameItem); err != nil {
 			c.handleFileError(err)
 			return
 		}
 	}
 
+	rec.MarkSuccess()
 	c.RespondSuccess(nil)
 }
 
-// MakeDirs creates directories with specified permissions
 func (c *FilesystemController) MakeDirs() {
+	rec := beginFilesystemMetric("mkdir")
+	defer rec.Finish(c.basicController)
+
 	var request map[string]model.Permission
 	if err := c.bindJSON(&request); err != nil {
 		c.RespondError(
@@ -164,14 +207,30 @@ func (c *FilesystemController) MakeDirs() {
 		}
 	}
 
+	rec.MarkSuccess()
 	c.RespondSuccess(nil)
 }
 
-// RemoveDirs recursively removes directories
 func (c *FilesystemController) RemoveDirs() {
+	rec := beginFilesystemMetric("rmdir")
+	defer rec.Finish(c.basicController)
+
 	paths := c.ctx.QueryArray("path")
 	for _, dir := range paths {
-		if err := os.RemoveAll(dir); err != nil {
+		resolvedDir, err := pathutil.ExpandPath(dir)
+		if err != nil {
+			c.RespondError(
+				http.StatusInternalServerError,
+				model.ErrorCodeRuntimeError,
+				fmt.Sprintf("error resolving directory %s. %v", dir, err),
+			)
+			return
+		}
+		if err := rejectStagingPath(resolvedDir); err != nil {
+			c.handleFileError(err)
+			return
+		}
+		if err := os.RemoveAll(resolvedDir); err != nil {
 			c.RespondError(
 				http.StatusInternalServerError,
 				model.ErrorCodeRuntimeError,
@@ -181,11 +240,14 @@ func (c *FilesystemController) RemoveDirs() {
 		}
 	}
 
+	rec.MarkSuccess()
 	c.RespondSuccess(nil)
 }
 
-// SearchFiles searches for files matching a pattern in a directory
-func (c *FilesystemController) SearchFiles() {
+func (c *FilesystemController) ListDirectory() {
+	rec := beginFilesystemMetric("listdir")
+	defer rec.Finish(c.basicController)
+
 	path := c.ctx.Query("path")
 	if path == "" {
 		c.RespondError(
@@ -196,7 +258,126 @@ func (c *FilesystemController) SearchFiles() {
 		return
 	}
 
-	path, err := filepath.Abs(path)
+	depth := 1
+	if rawDepth := c.ctx.Query("depth"); rawDepth != "" {
+		parsedDepth, err := strconv.Atoi(rawDepth)
+		if err != nil || parsedDepth < 0 {
+			c.RespondError(
+				http.StatusBadRequest,
+				model.ErrorCodeInvalidRequest,
+				fmt.Sprintf("invalid query parameter 'depth': %s", rawDepth),
+			)
+			return
+		}
+		depth = parsedDepth
+	}
+
+	path, err := pathutil.ExpandAbsPath(path)
+	if err != nil {
+		c.RespondError(
+			http.StatusInternalServerError,
+			model.ErrorCodeRuntimeError,
+			fmt.Sprintf("error converting path %s to absolute. %v", path, err),
+		)
+		return
+	}
+
+	// Use Lstat so a symlink passed as the root is detected and rejected
+	// rather than silently followed: /directories/list never traverses
+	// symlinks (see the public spec), so listing through a symlink-as-root
+	// would expose a different subtree than the caller asked for.
+	info, err := os.Lstat(path)
+	if err != nil {
+		c.handleFileError(err)
+		return
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		c.RespondError(
+			http.StatusBadRequest,
+			model.ErrorCodeInvalidRequest,
+			fmt.Sprintf("path is a symbolic link, refusing to traverse: %s", path),
+		)
+		return
+	}
+	if !info.IsDir() {
+		c.RespondError(
+			http.StatusBadRequest,
+			model.ErrorCodeInvalidRequest,
+			fmt.Sprintf("path is not a directory: %s", path),
+		)
+		return
+	}
+
+	entries, err := listDirectoryEntries(path, depth)
+	if err != nil {
+		c.RespondError(
+			http.StatusInternalServerError,
+			model.ErrorCodeRuntimeError,
+			fmt.Sprintf("error listing directory %s. %v", path, err),
+		)
+		return
+	}
+
+	rec.MarkSuccess()
+	c.RespondSuccess(entries)
+}
+
+func listDirectoryEntries(root string, maxDepth int) ([]model.FileInfo, error) {
+	entries := make([]model.FileInfo, 0, 16)
+	if maxDepth == 0 {
+		return entries, nil
+	}
+
+	var walk func(string, int) error
+	walk = func(dir string, currentDepth int) error {
+		dirEntries, err := os.ReadDir(dir)
+		if err != nil {
+			return err
+		}
+
+		for _, entry := range dirEntries {
+			if isAnyStagingName(entry.Name()) {
+				continue
+			}
+			entryPath := filepath.Join(dir, entry.Name())
+			info, err := entry.Info()
+			if err != nil {
+				return err
+			}
+
+			entryInfo, err := buildFileInfo(entryPath, info)
+			if err != nil {
+				return err
+			}
+			entries = append(entries, entryInfo)
+
+			if entry.IsDir() && currentDepth+1 < maxDepth {
+				if err := walk(entryPath, currentDepth+1); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+
+	return entries, walk(root, 0)
+}
+
+func (c *FilesystemController) SearchFiles() {
+	rec := beginFilesystemMetric("search")
+	defer rec.Finish(c.basicController)
+
+	path := c.ctx.Query("path")
+	if path == "" {
+		c.RespondError(
+			http.StatusBadRequest,
+			model.ErrorCodeMissingQuery,
+			"missing query parameter 'path'",
+		)
+		return
+	}
+
+	path, err := pathutil.ExpandAbsPath(path)
 	if err != nil {
 		c.RespondError(
 			http.StatusInternalServerError,
@@ -216,16 +397,27 @@ func (c *FilesystemController) SearchFiles() {
 	if pattern == "" {
 		pattern = "**"
 	}
+	if !glob.ValidPattern(pattern) {
+		c.RespondError(
+			http.StatusBadRequest,
+			model.ErrorCodeInvalidRequest,
+			fmt.Sprintf("invalid pattern %s", pattern),
+		)
+		return
+	}
 
 	files := make([]model.FileInfo, 0, 16)
 	err = filepath.Walk(path, func(filePath string, info os.FileInfo, err error) error {
-		if os.IsNotExist(err) {
+		if errors.Is(err, fs.ErrNotExist) {
 			return nil
 		}
 		if err != nil {
 			return fmt.Errorf("error accessing path %s: %w", filePath, err)
 		}
 		if info.IsDir() {
+			return nil
+		}
+		if isAnyStagingName(info.Name()) {
 			return nil
 		}
 
@@ -235,33 +427,11 @@ func (c *FilesystemController) SearchFiles() {
 		}
 
 		if match {
-			sys := info.Sys().(*syscall.Stat_t)
-
-			owner, err := user.LookupId(strconv.FormatUint(uint64(sys.Uid), 10))
+			fileInfo, err := buildFileInfo(filePath, info)
 			if err != nil {
-				return fmt.Errorf("error lookup owner for file %s: %w", filePath, err)
+				return err
 			}
-
-			group, err := user.LookupGroupId(strconv.FormatUint(uint64(sys.Gid), 10))
-			if err != nil {
-				return fmt.Errorf("error lookup group for file %s: %w", filePath, err)
-			}
-
-			files = append(files, model.FileInfo{
-				Path:       filePath,
-				Size:       info.Size(),
-				ModifiedAt: info.ModTime(),
-				CreatedAt:  getFileCreateTime(info),
-				Permission: model.Permission{
-					Owner: owner.Username,
-					Group: group.Name,
-					Mode: func() int {
-						mode := strconv.FormatInt(int64(info.Mode().Perm()), 8)
-						i, _ := strconv.Atoi(mode)
-						return i
-					}(),
-				},
-			})
+			files = append(files, fileInfo)
 		}
 
 		return nil
@@ -276,11 +446,16 @@ func (c *FilesystemController) SearchFiles() {
 		return
 	}
 
+	rec.MarkSuccess()
 	c.RespondSuccess(files)
 }
 
-// ReplaceContent replaces text content in specified files
 func (c *FilesystemController) ReplaceContent() {
+	rec := beginFilesystemMetric("replace")
+	defer rec.Finish(c.basicController)
+
+	verbose := c.ctx.Query("verbose") == "true"
+
 	var request map[string]model.ReplaceFileContentItem
 	if err := c.bindJSON(&request); err != nil {
 		c.RespondError(
@@ -291,9 +466,19 @@ func (c *FilesystemController) ReplaceContent() {
 		return
 	}
 
+	var results map[string]model.ReplaceFileContentResult
+	if verbose {
+		results = make(map[string]model.ReplaceFileContentResult)
+	}
+
 	for file, item := range request {
-		file, err := filepath.Abs(file)
+		origPath := file
+		file, err := pathutil.ExpandAbsPath(file)
 		if err != nil {
+			c.handleFileError(err)
+			return
+		}
+		if err := rejectStagingPath(file); err != nil {
 			c.handleFileError(err)
 			return
 		}
@@ -316,14 +501,31 @@ func (c *FilesystemController) ReplaceContent() {
 		}
 		mode := fileInfo.Mode()
 
-		newContent := strings.ReplaceAll(string(content), item.Old, item.New)
+		if item.Old == "" {
+			c.RespondError(http.StatusBadRequest, model.ErrorCodeInvalidRequest, "old content must not be empty")
+			return
+		}
+
+		contentStr := string(content)
+		newContent := strings.ReplaceAll(contentStr, item.Old, item.New)
 
 		err = os.WriteFile(file, []byte(newContent), mode)
 		if err != nil {
 			c.handleFileError(err)
 			return
 		}
+
+		if verbose {
+			results[origPath] = model.ReplaceFileContentResult{
+				ReplacedCount: strings.Count(contentStr, item.Old),
+			}
+		}
 	}
 
-	c.RespondSuccess(nil)
+	rec.MarkSuccess()
+	if verbose {
+		c.RespondSuccess(results)
+	} else {
+		c.RespondSuccess(nil)
+	}
 }

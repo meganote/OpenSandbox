@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -29,11 +29,13 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	sandboxv1alpha1 "github.com/alibaba/OpenSandbox/sandbox-k8s/apis/sandbox/v1alpha1"
+	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/utils/expectations"
 	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/utils/fieldindex"
 	// +kubebuilder:scaffold:imports
 )
@@ -85,7 +87,8 @@ var _ = BeforeSuite(func() {
 	Expect(cfg).NotTo(BeNil())
 
 	k8sManager, err = ctrl.NewManager(cfg, ctrl.Options{
-		Scheme: scheme.Scheme,
+		Scheme:  scheme.Scheme,
+		Metrics: metricsserver.Options{BindAddress: "0"},
 	})
 	Expect(err).ToNot(HaveOccurred())
 	By("register field index")
@@ -93,17 +96,18 @@ var _ = BeforeSuite(func() {
 
 	By("setup reconciler")
 	Expect((&BatchSandboxReconciler{
-		Client:   k8sManager.GetClient(),
-		Scheme:   k8sManager.GetScheme(),
-		Recorder: k8sManager.GetEventRecorderFor("test-batch-sandbox-controller"),
-	}).SetupWithManager(k8sManager)).Should(Succeed())
+		Client:              k8sManager.GetClient(),
+		Scheme:              k8sManager.GetScheme(),
+		Recorder:            k8sManager.GetEventRecorderFor("test-batch-sandbox-controller"),
+		StatusRVExpectation: expectations.NewResourceVersionExpectation(),
+	}).SetupWithManager(k8sManager, 32)).Should(Succeed())
 	Expect((&PoolReconciler{
-		Client:    k8sManager.GetClient(),
-		Scheme:    k8sManager.GetScheme(),
-		Recorder:  k8sManager.GetEventRecorderFor("test-pool-controller"),
-		Allocator: NewDefaultAllocator(k8sManager.GetClient()),
-	}).SetupWithManager(k8sManager)).Should(Succeed())
-	// TODO more reconciler goes HERE
+		Client:     k8sManager.GetClient(),
+		Scheme:     k8sManager.GetScheme(),
+		Recorder:   k8sManager.GetEventRecorderFor("test-pool-controller"),
+		Allocator:  NewDefaultAllocator(k8sManager.GetClient()),
+		RestConfig: cfg,
+	}).SetupWithManager(k8sManager, 128)).Should(Succeed())
 
 	By("try to start manager")
 	mgrStopped = startTestManager(ctx, k8sManager)
@@ -120,7 +124,9 @@ func startTestManager(ctx context.Context, mgr manager.Manager) *sync.WaitGroup 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		Expect(mgr.Start(ctx)).Should(Succeed(), "failed to start manager")
+		defer GinkgoRecover()
+		err := mgr.Start(ctx)
+		Expect(err).ShouldNot(HaveOccurred(), "failed to start manager")
 	}()
 	return wg
 }

@@ -1,5 +1,5 @@
 #
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -32,10 +32,14 @@ def _get_kwargs(
     port: int,
     *,
     use_server_proxy: bool | Unset = False,
+    expires: str | Unset = UNSET,
 ) -> dict[str, Any]:
+
     params: dict[str, Any] = {}
 
     params["use_server_proxy"] = use_server_proxy
+
+    params["expires"] = expires
 
     params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
 
@@ -59,23 +63,43 @@ def _parse_response(
 
         return response_200
 
+    if response.status_code == 400:
+        try:
+            response_400 = ErrorResponse.from_dict(response.json())
+        except (ValueError, TypeError, KeyError):
+            return None
+
+        return response_400
+
     if response.status_code == 401:
-        response_401 = ErrorResponse.from_dict(response.json())
+        try:
+            response_401 = ErrorResponse.from_dict(response.json())
+        except (ValueError, TypeError, KeyError):
+            return None
 
         return response_401
 
     if response.status_code == 403:
-        response_403 = ErrorResponse.from_dict(response.json())
+        try:
+            response_403 = ErrorResponse.from_dict(response.json())
+        except (ValueError, TypeError, KeyError):
+            return None
 
         return response_403
 
     if response.status_code == 404:
-        response_404 = ErrorResponse.from_dict(response.json())
+        try:
+            response_404 = ErrorResponse.from_dict(response.json())
+        except (ValueError, TypeError, KeyError):
+            return None
 
         return response_404
 
     if response.status_code == 500:
-        response_500 = ErrorResponse.from_dict(response.json())
+        try:
+            response_500 = ErrorResponse.from_dict(response.json())
+        except (ValueError, TypeError, KeyError):
+            return None
 
         return response_500
 
@@ -102,6 +126,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
     use_server_proxy: bool | Unset = False,
+    expires: str | Unset = UNSET,
 ) -> Response[Endpoint | ErrorResponse]:
     """Get sandbox access endpoint
 
@@ -113,6 +138,7 @@ def sync_detailed(
         sandbox_id (str):
         port (int):
         use_server_proxy (bool | Unset):  Default: False.
+        expires (str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -126,6 +152,7 @@ def sync_detailed(
         sandbox_id=sandbox_id,
         port=port,
         use_server_proxy=use_server_proxy,
+        expires=expires,
     )
 
     response = client.get_httpx_client().request(
@@ -141,6 +168,7 @@ def sync(
     *,
     client: AuthenticatedClient | Client,
     use_server_proxy: bool | Unset = False,
+    expires: str | Unset = UNSET,
 ) -> Endpoint | ErrorResponse | None:
     """Get sandbox access endpoint
 
@@ -152,6 +180,7 @@ def sync(
         sandbox_id (str):
         port (int):
         use_server_proxy (bool | Unset):  Default: False.
+        expires (str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -166,6 +195,7 @@ def sync(
         port=port,
         client=client,
         use_server_proxy=use_server_proxy,
+        expires=expires,
     ).parsed
 
 
@@ -175,6 +205,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
     use_server_proxy: bool | Unset = False,
+    expires: str | Unset = UNSET,
 ) -> Response[Endpoint | ErrorResponse]:
     """Get sandbox access endpoint
 
@@ -186,6 +217,7 @@ async def asyncio_detailed(
         sandbox_id (str):
         port (int):
         use_server_proxy (bool | Unset):  Default: False.
+        expires (str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -199,6 +231,7 @@ async def asyncio_detailed(
         sandbox_id=sandbox_id,
         port=port,
         use_server_proxy=use_server_proxy,
+        expires=expires,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -212,6 +245,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient | Client,
     use_server_proxy: bool | Unset = False,
+    expires: str | Unset = UNSET,
 ) -> Endpoint | ErrorResponse | None:
     """Get sandbox access endpoint
 
@@ -223,6 +257,7 @@ async def asyncio(
         sandbox_id (str):
         port (int):
         use_server_proxy (bool | Unset):  Default: False.
+        expires (str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -238,5 +273,6 @@ async def asyncio(
             port=port,
             client=client,
             use_server_proxy=use_server_proxy,
+            expires=expires,
         )
     ).parsed

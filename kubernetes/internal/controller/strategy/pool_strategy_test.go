@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -58,12 +58,21 @@ func TestDefaultPoolStrategy_IsPooledMode(t *testing.T) {
 			},
 			want: true,
 		},
+		{
+			name: "with PoolRef star - pooled mode",
+			batchSbx: &sandboxv1alpha1.BatchSandbox{
+				Spec: sandboxv1alpha1.BatchSandboxSpec{
+					PoolRef: "*",
+				},
+			},
+			want: true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			strategy := NewDefaultPoolStrategy(tt.batchSbx)
+			strategy := newDefaultPoolStrategy(tt.batchSbx)
 			if got := strategy.IsPooledMode(); got != tt.want {
-				t.Errorf("DefaultPoolStrategy.IsPooledMode() = %v, want %v", got, tt.want)
+				t.Errorf("defaultPoolStrategy.IsPooledMode() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -76,7 +85,7 @@ func TestNewPoolStrategy(t *testing.T) {
 		wantStrategy string
 	}{
 		{
-			name: "without resource-speedup label - returns DefaultPoolStrategy",
+			name: "without resource-speedup label - returns defaultPoolStrategy",
 			batchSbx: &sandboxv1alpha1.BatchSandbox{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{},
@@ -85,7 +94,7 @@ func TestNewPoolStrategy(t *testing.T) {
 					Template: nil,
 				},
 			},
-			wantStrategy: "*strategy.DefaultPoolStrategy",
+			wantStrategy: "*strategy.defaultPoolStrategy",
 		},
 	}
 	for _, tt := range tests {
@@ -94,6 +103,48 @@ func TestNewPoolStrategy(t *testing.T) {
 			gotType := getTypeName(got)
 			if gotType != tt.wantStrategy {
 				t.Errorf("NewPoolStrategy() = %v, want %v", gotType, tt.wantStrategy)
+			}
+		})
+	}
+}
+
+func TestDefaultPoolStrategy_AssignProfile(t *testing.T) {
+	tests := []struct {
+		name     string
+		batchSbx *sandboxv1alpha1.BatchSandbox
+		want     string
+	}{
+		{
+			name: "PoolRef star - returns default profile",
+			batchSbx: &sandboxv1alpha1.BatchSandbox{
+				Spec: sandboxv1alpha1.BatchSandboxSpec{
+					PoolRef: "*",
+				},
+			},
+			want: "default",
+		},
+		{
+			name: "PoolRef concrete name - empty profile",
+			batchSbx: &sandboxv1alpha1.BatchSandbox{
+				Spec: sandboxv1alpha1.BatchSandboxSpec{
+					PoolRef: "test-pool",
+				},
+			},
+			want: "",
+		},
+		{
+			name: "PoolRef empty - empty profile",
+			batchSbx: &sandboxv1alpha1.BatchSandbox{
+				Spec: sandboxv1alpha1.BatchSandboxSpec{},
+			},
+			want: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newDefaultPoolStrategy(tt.batchSbx)
+			if got := s.AssignProfile(); got != tt.want {
+				t.Errorf("defaultPoolStrategy.AssignProfile() = %v, want %v", got, tt.want)
 			}
 		})
 	}

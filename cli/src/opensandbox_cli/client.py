@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import timedelta
+from pathlib import Path
 from typing import Any
 
 from opensandbox.config.connection_sync import ConnectionConfigSync
@@ -32,13 +33,21 @@ class ClientContext:
     """Shared context passed via ``ctx.obj`` to all Click commands."""
 
     resolved_config: dict[str, Any]
-    output: OutputFormatter
+    config_path: Path
+    cli_overrides: dict[str, Any]
+    output: OutputFormatter = field(init=False)
     _connection_config: ConnectionConfigSync | None = field(
         default=None, init=False, repr=False
     )
     _manager: SandboxManagerSync | None = field(
         default=None, init=False, repr=False
     )
+
+    def __post_init__(self) -> None:
+        self.output = OutputFormatter(
+            "table",
+            color=self.resolved_config.get("color", True),
+        )
 
     @property
     def connection_config(self) -> ConnectionConfigSync:
@@ -49,6 +58,7 @@ class ClientContext:
                 domain=cfg.get("domain"),
                 protocol=cfg.get("protocol", "http"),
                 request_timeout=timedelta(seconds=cfg.get("request_timeout", 30)),
+                use_server_proxy=cfg.get("use_server_proxy", False),
             )
         return self._connection_config
 
@@ -67,6 +77,15 @@ class ClientContext:
             connection_config=self.connection_config,
             skip_health_check=skip_health_check,
         )
+
+    def make_output(self, fmt: str) -> OutputFormatter:
+        """Create and cache the current command-scoped output formatter."""
+        formatter = OutputFormatter(
+            fmt,
+            color=self.resolved_config.get("color", True),
+        )
+        self.output = formatter
+        return formatter
 
     def close(self) -> None:
         """Release resources."""

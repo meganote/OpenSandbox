@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,12 +23,13 @@ using openapi-python-client, which generates httpx-based async clients
 that support custom httpx.AsyncClient injection.
 """
 
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-APACHE_2_LICENSE_HEADER = """#\n# Copyright 2026 Alibaba Group Holding Ltd.\n#\n# Licensed under the Apache License, Version 2.0 (the "License");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an "AS IS" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n#\n\n"""
+APACHE_2_LICENSE_HEADER = """#\n# Copyright 2026 The OpenSandbox Authors\n#\n# Licensed under the Apache License, Version 2.0 (the "License");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an "AS IS" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n#\n\n"""
 
 
 def run_command(cmd: list[str], description: str) -> subprocess.CompletedProcess:
@@ -102,6 +103,114 @@ def generate_execd_api_client() -> None:
         print(f"✅ Moved generated code to {output_path}")
     else:
         # If package name doesn't match, find the generated package
+        for item in temp_output.iterdir():
+            if item.is_dir() and not item.name.startswith("."):
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(item), str(output_path))
+                shutil.rmtree(temp_output)
+                print(f"✅ Moved generated code from {item} to {output_path}")
+                break
+
+
+def generate_egress_api_client() -> None:
+    """Generate the egress API client from OpenAPI spec."""
+    print("\n🔧 Generating egress API client...")
+
+    spec_path = Path("../../../specs/egress-api.yaml").resolve()
+    output_path = Path("src/opensandbox/api/egress")
+    config_path = Path("scripts/openapi_egress_config.yaml")
+    temp_output = Path("temp_egress_client")
+
+    if not spec_path.exists():
+        print(f"❌ OpenAPI spec not found at {spec_path}")
+        print("Please ensure the specs directory is available")
+        return
+
+    if output_path.exists():
+        shutil.rmtree(output_path)
+
+    if temp_output.exists():
+        shutil.rmtree(temp_output)
+
+    cmd = [
+        "openapi-python-client",
+        "generate",
+        "--path",
+        str(spec_path),
+        "--output-path",
+        str(temp_output),
+        "--config",
+        str(config_path),
+        "--overwrite",
+    ]
+
+    try:
+        run_command(cmd, "Generating egress API client")
+    except subprocess.CalledProcessError:
+        print("❌ Failed to generate egress API client")
+        return
+
+    generated_package = temp_output / "opensandbox_api_egress"
+    if generated_package.exists():
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(generated_package), str(output_path))
+        shutil.rmtree(temp_output)
+        print(f"✅ Moved generated code to {output_path}")
+    else:
+        for item in temp_output.iterdir():
+            if item.is_dir() and not item.name.startswith("."):
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(item), str(output_path))
+                shutil.rmtree(temp_output)
+                print(f"✅ Moved generated code from {item} to {output_path}")
+                break
+
+
+def generate_diagnostic_api_client() -> None:
+    """Generate the diagnostics API client from OpenAPI spec."""
+    print("\n🔧 Generating diagnostics API client...")
+
+    spec_path = Path("../../../specs/diagnostic-api.yml").resolve()
+    output_path = Path("src/opensandbox/api/diagnostic")
+    config_path = Path("scripts/openapi_diagnostic_config.yaml")
+    temp_output = Path("temp_diagnostic_client")
+
+    if not spec_path.exists():
+        print(f"❌ OpenAPI spec not found at {spec_path}")
+        print("Please ensure the specs directory is available")
+        return
+
+    if output_path.exists():
+        shutil.rmtree(output_path)
+
+    if temp_output.exists():
+        shutil.rmtree(temp_output)
+
+    cmd = [
+        "openapi-python-client",
+        "generate",
+        "--path",
+        str(spec_path),
+        "--output-path",
+        str(temp_output),
+        "--config",
+        str(config_path),
+        "--overwrite",
+    ]
+
+    try:
+        run_command(cmd, "Generating diagnostics API client")
+    except subprocess.CalledProcessError:
+        print("❌ Failed to generate diagnostics API client")
+        return
+
+    generated_package = temp_output / "opensandbox_api_diagnostic"
+    if generated_package.exists():
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(generated_package), str(output_path))
+        shutil.rmtree(temp_output)
+        print(f"✅ Moved generated code to {output_path}")
+    else:
         for item in temp_output.iterdir():
             if item.is_dir() and not item.name.startswith("."):
                 output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -195,57 +304,101 @@ def add_license_headers(root: Path) -> None:
     )
 
 
-def patch_lifecycle_nullable_nested_models(root: Path) -> None:
-    """Patch generated lifecycle models that openapi-python-client does not null-handle."""
-    replacements = {
-        root / "models" / "image_spec.py": [
-            (
-                "        if isinstance(_auth, Unset):\n            auth = UNSET\n",
-                "        if isinstance(_auth, Unset) or _auth is None:\n            auth = UNSET\n",
-            )
-        ],
-        root / "models" / "create_sandbox_response.py": [
-            (
-                "        if isinstance(_metadata, Unset):\n            metadata = UNSET\n",
-                "        if isinstance(_metadata, Unset) or _metadata is None:\n            metadata = UNSET\n",
-            )
-        ],
-        root / "models" / "sandbox.py": [
-            (
-                "        if isinstance(_metadata, Unset):\n            metadata = UNSET\n",
-                "        if isinstance(_metadata, Unset) or _metadata is None:\n            metadata = UNSET\n",
-            )
-        ],
-        root / "models" / "sandbox_status.py": [
-            (
-                "        if isinstance(_last_transition_at, Unset):\n            last_transition_at = UNSET\n",
-                "        if isinstance(_last_transition_at, Unset) or _last_transition_at is None:\n            last_transition_at = UNSET\n",
-            )
-        ],
-    }
 
-    patched_files = 0
-    for file_path, file_replacements in replacements.items():
-        if not file_path.exists():
-            continue
+def post_process_execd_filesystem(root: Path) -> None:
+    """Keep filesystem generation aligned with base-URL identity routing."""
+    # Identity clients reuse the ordinary operations with a scoped base URL.
+    # Avoid shipping duplicate operations that are not used by the adapters.
+    identity_operations = root / "api/filesystem_identity"
+    if identity_operations.exists():
+        shutil.rmtree(identity_operations)
 
-        content = file_path.read_text(encoding="utf-8")
-        updated = content
-        for old, new in file_replacements:
-            if old in updated:
-                updated = updated.replace(old, new, 1)
+    # Execd returns an empty 200 body unless verbose is supported and enabled.
+    # Preserve this compatibility fix whenever the transport is regenerated.
+    replace_operation = root / "api/filesystem/replace_content.py"
+    if replace_operation.exists():
+        content = replace_operation.read_text(encoding="utf-8")
+        branch = "    if response.status_code == 200:\n"
+        guarded_branch = branch + "        if not response.content:\n            return None\n"
+        if guarded_branch not in content:
+            if branch not in content:
+                raise ValueError("Generated replace_content has no expected 200 response branch")
+            replace_operation.write_text(content.replace(branch, guarded_branch, 1), encoding="utf-8")
 
+
+_ERROR_RESPONSE_PARSE = re.compile(
+    r"^(    if response\.status_code == (\d{3}):\n)"
+    r"        (response_\2 = ErrorResponse\.from_dict\(response\.json\(\)\))\n",
+    re.MULTILINE,
+)
+
+
+def tolerate_unparsable_error_bodies(root: Path) -> None:
+    """Leave error bodies that are not an ErrorResponse unparsed.
+
+    A gateway or proxy can answer with an HTML, plain-text or empty body. The
+    generated parser would raise while decoding it, and the SDK would report
+    that as an invalid argument without the status code. Returning ``None``
+    lets ``handle_api_error`` raise ``SandboxApiException`` with the status and
+    the raw body instead.
+    """
+    replacement = (
+        r"\1        try:\n"
+        r"            \3\n"
+        r"        except (ValueError, TypeError, KeyError):\n"
+        r"            return None\n"
+    )
+    for path in root.rglob("*.py"):
+        content = path.read_text(encoding="utf-8")
+        updated = _ERROR_RESPONSE_PARSE.sub(replacement, content)
         if updated != content:
-            file_path.write_text(updated, encoding="utf-8")
-            patched_files += 1
+            path.write_text(updated, encoding="utf-8")
 
-    if patched_files:
-        print(f"✅ Patched nullable lifecycle model handling in {patched_files} files")
+
+def redact_credential_reprs() -> None:
+    """Keep write-only credential values out of generated-model reprs.
+
+    attrs synthesizes ``__repr__`` over any class-level definition, so a
+    module-level override is appended instead: ``CredentialSource.value`` is
+    write-only material and must never surface in logs, exception messages
+    (pydantic/attrs reprs included), or debug output. ``endpoint`` is
+    configuration rather than secret material and stays visible.
+    """
+    redaction = (
+        "\n\n"
+        "# Redacted repr: the credential value is write-only and must never\n"
+        "# surface in logs, exception messages, or debug output. attrs would\n"
+        "# overwrite a class-level __repr__, so the override is applied on the\n"
+        "# class object after definition.\n"
+        "def _redacted_repr(self: CredentialSource) -> str:\n"
+        "    value = \"***\" if self.value is not UNSET else \"UNSET\"\n"
+        "    return (\n"
+        "        f\"{type(self).__name__}(type_={self.type_!r}, value={value},\"\n"
+        "        f\" endpoint={self.endpoint!r})\"\n"
+        "    )\n"
+        "\n\n"
+        "CredentialSource.__repr__ = _redacted_repr  # type: ignore[method-assign]\n"
+    )
+    for rel in (
+        "src/opensandbox/api/lifecycle/models/credential_source.py",
+        "src/opensandbox/api/egress/models/credential_source.py",
+    ):
+        path = Path(rel)
+        if not path.exists():
+            continue
+        content = path.read_text(encoding="utf-8")
+        if "_redacted_repr" in content:
+            continue
+        path.write_text(content.rstrip("\n") + "\n" + redaction, encoding="utf-8")
+        print(f"✅ Redacted credential repr in {rel}")
 
 
 def post_process_generated_code() -> None:
     """Post-process the generated code to ensure proper package structure."""
     print("\n🔧 Post-processing generated code...")
+    post_process_execd_filesystem(Path("src/opensandbox/api/execd"))
+    redact_credential_reprs()
+    tolerate_unparsable_error_bodies(Path("src/opensandbox/api"))
 
     # Ensure API directory has __init__.py
     api_dir = Path("src/opensandbox/api")
@@ -259,9 +412,10 @@ def post_process_generated_code() -> None:
 
     # Ensure all generated python files have a license header.
     add_license_headers(Path("src/opensandbox/api/execd"))
+    add_license_headers(Path("src/opensandbox/api/egress"))
+    add_license_headers(Path("src/opensandbox/api/diagnostic"))
     add_license_headers(Path("src/opensandbox/api/lifecycle"))
     add_license_headers(Path("src/opensandbox/api"))
-    patch_lifecycle_nullable_nested_models(Path("src/opensandbox/api/lifecycle"))
 
 
 def main() -> None:
@@ -289,6 +443,8 @@ def main() -> None:
 
     # Generate API clients
     generate_execd_api_client()
+    generate_egress_api_client()
+    generate_diagnostic_api_client()
     generate_sandbox_lifecycle_api()
 
     # Post-process
@@ -297,6 +453,8 @@ def main() -> None:
     print("\n✅ API client generation completed!")
     print("Generated clients:")
     print("  - src/opensandbox/api/execd/")
+    print("  - src/opensandbox/api/egress/")
+    print("  - src/opensandbox/api/diagnostic/")
     print("  - src/opensandbox/api/lifecycle/")
     print("\nThe generated clients support custom httpx.AsyncClient injection:")
     print("  from opensandbox.api.execd import Client, AuthenticatedClient")

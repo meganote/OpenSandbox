@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,15 +23,29 @@ from datetime import datetime, timedelta
 from typing import Protocol
 
 from opensandbox.models.sandboxes import (
+    CreateSnapshotRequest,
+    CredentialProxyConfig,
+    IdlePolicy,
     NetworkPolicy,
     PagedSandboxInfos,
+    PagedSnapshotInfos,
+    PlatformSpec,
     SandboxCreateResponse,
     SandboxEndpoint,
     SandboxFilter,
     SandboxImageSpec,
     SandboxInfo,
+    SandboxLifecycle,
     SandboxRenewResponse,
+    SnapshotFilter,
+    SnapshotInfo,
     Volume,
+)
+from opensandbox.models.templates import (
+    CreateTemplateRequest,
+    PagedTemplateInfos,
+    TemplateFilter,
+    TemplateInfo,
 )
 
 
@@ -45,8 +59,8 @@ class Sandboxes(Protocol):
 
     async def create_sandbox(
         self,
-        spec: SandboxImageSpec,
-        entrypoint: list[str],
+        spec: SandboxImageSpec | None,
+        entrypoint: list[str] | None,
         env: dict[str, str],
         metadata: dict[str, str],
         timeout: timedelta | None,
@@ -54,6 +68,12 @@ class Sandboxes(Protocol):
         network_policy: NetworkPolicy | None,
         extensions: dict[str, str],
         volumes: list[Volume] | None,
+        platform: PlatformSpec | None = None,
+        secure_access: bool = False,
+        snapshot_id: str | None = None,
+        credential_proxy: CredentialProxyConfig | None = None,
+        resource_requests: dict[str, str] | None = None,
+        lifecycle: SandboxLifecycle | None = None,
     ) -> SandboxCreateResponse:
         """
         Create a new sandbox with the specified configuration.
@@ -66,9 +86,44 @@ class Sandboxes(Protocol):
             timeout: Sandbox lifetime. Pass None to create a sandbox that requires explicit cleanup.
             resource: Runtime resource limits (e.g. cpu/memory). Exact semantics are server-defined.
             network_policy: Optional outbound network policy (egress).
+            credential_proxy: Optional Credential Vault proxy startup settings.
             extensions: Opaque extension parameters passed through to the server as-is.
                 Prefer namespaced keys (e.g. ``storage.id``).
             volumes: Optional list of volume mounts for persistent storage.
+            secure_access: Whether to enable secured access for sandbox endpoints.
+            lifecycle: Optional pre-start and periodic lifecycle hooks.
+
+        Returns:
+            Sandbox create response
+
+        Raises:
+            SandboxException: if the operation fails
+        """
+        ...
+
+    async def create_sandbox_from_template(
+        self,
+        template_id: str,
+        timeout: timedelta,
+        metadata: dict[str, str] | None = None,
+        network_policy: NetworkPolicy | None = None,
+        extensions: dict[str, str] | None = None,
+        idle_policy: IdlePolicy | None = None,
+    ) -> SandboxCreateResponse:
+        """
+        Create a sandbox from a ``Succeeded`` fsb template.
+
+        Template mode fixes the workload shape on the server: only metadata,
+        network policy, extensions and the control-plane ``idle_policy``
+        may accompany the template id, and the timeout is required.
+
+        Args:
+            template_id: Succeeded fsb template to create the sandbox from
+            timeout: Sandbox lifetime (required in template mode)
+            metadata: User-defined metadata used for management and filtering
+            network_policy: Optional outbound network policy (egress)
+            extensions: Opaque extension parameters passed through to the server as-is
+            idle_policy: Optional idle behavior (OSEP-0024, fast-sandbox only)
 
         Returns:
             Sandbox create response
@@ -108,6 +163,24 @@ class Sandboxes(Protocol):
         """
         ...
 
+    async def patch_sandbox_metadata(
+        self, sandbox_id: str, patch: dict[str, str | None]
+    ) -> SandboxInfo:
+        """
+        Patch sandbox metadata.
+
+        Args:
+            sandbox_id: Unique identifier of the sandbox
+            patch: Metadata merge patch. String values add or replace keys; None deletes keys.
+
+        Returns:
+            Current sandbox information after applying the patch
+
+        Raises:
+            SandboxException: if the operation fails
+        """
+        ...
+
     async def get_sandbox_endpoint(
         self, sandbox_id: str, port: int, use_server_proxy: bool = False
     ) -> SandboxEndpoint:
@@ -117,7 +190,28 @@ class Sandboxes(Protocol):
         Args:
             sandbox_id: Sandbox ID
             port: Endpoint port number
-            use_server_proxy: Whether to use server proxy for endpoint
+            use_server_proxy: Deprecated: the server proxy data path is in maintenance mode (security and bug fixes only); prefer the ingress gateway.
+
+        Returns:
+            Target sandbox endpoint
+
+        Raises:
+            SandboxException: if the operation fails
+        """
+        ...
+
+    async def get_signed_sandbox_endpoint(
+        self, sandbox_id: str, port: int, expires: int,
+        use_server_proxy: bool = False,
+    ) -> SandboxEndpoint:
+        """
+        Get signed sandbox endpoint with an OSEP-0011 route token.
+
+        Args:
+            sandbox_id: Sandbox ID
+            port: Endpoint port number
+            expires: Unix epoch seconds for the signed route token expiry
+            use_server_proxy: Deprecated: the server proxy data path is in maintenance mode (security and bug fixes only); prefer the ingress gateway.
 
         Returns:
             Target sandbox endpoint
@@ -171,7 +265,8 @@ class Sandboxes(Protocol):
 
     async def kill_sandbox(self, sandbox_id: str) -> None:
         """
-        Terminate a sandbox and release all associated resources.
+        Request irreversible termination of the remote sandbox. Returns when
+        deletion is accepted; runtime cleanup may continue afterward.
 
         Args:
             sandbox_id: Unique identifier of the sandbox
@@ -179,4 +274,70 @@ class Sandboxes(Protocol):
         Raises:
             SandboxException: if the operation fails
         """
+        ...
+
+    async def create_snapshot(
+        self, sandbox_id: str, request: CreateSnapshotRequest | None = None
+    ) -> SnapshotInfo:
+        """Create a persistent snapshot from a sandbox."""
+        ...
+
+    async def get_snapshot(self, snapshot_id: str) -> SnapshotInfo:
+        """Retrieve information about an existing snapshot."""
+        ...
+
+    async def list_snapshots(self, filter: SnapshotFilter) -> PagedSnapshotInfos:
+        """List snapshots with optional filtering."""
+        ...
+
+    async def delete_snapshot(self, snapshot_id: str) -> None:
+        """Delete a snapshot."""
+        ...
+
+    async def create_template(self, request: CreateTemplateRequest) -> TemplateInfo:
+        """
+        Create a fsb template (golden-image build).
+
+        The build runs asynchronously: the response carries
+        ``status.phase: Pending``; poll ``get_template`` until ``Succeeded``
+        (or ``Failed``). Only ``Succeeded`` templates can back template-based
+        sandbox creation.
+
+        Raises:
+            SandboxException: if the operation fails
+        """
+        ...
+
+    async def get_template(self, template_id: str) -> TemplateInfo:
+        """
+        Get one template with its latest build status.
+
+        Raises:
+            SandboxException: if the operation fails
+        """
+        ...
+
+    async def list_templates(self, filter: TemplateFilter) -> PagedTemplateInfos:
+        """
+        List the current tenant's templates with optional metadata filtering
+        (AND logic) and pagination.
+
+        Raises:
+            SandboxException: if the operation fails
+        """
+        ...
+
+    async def delete_template(self, template_id: str) -> None:
+        """
+        Delete a template.
+
+        Sandboxes already created from the template are unaffected.
+
+        Raises:
+            SandboxException: if the operation fails
+        """
+        ...
+
+    def invalidate_endpoint_cache(self, sandbox_id: str) -> None:
+        """Remove all cached endpoints for a sandbox. No-op if caching is disabled."""
         ...

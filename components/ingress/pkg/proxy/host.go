@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,42 +18,207 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
+	"time"
+
+	"github.com/alibaba/opensandbox/ingress/pkg/routescope"
+	"github.com/alibaba/opensandbox/ingress/pkg/sandbox"
+	"github.com/alibaba/opensandbox/ingress/pkg/signature"
+	"github.com/alibaba/opensandbox/ingress/pkg/telemetry"
 )
 
-type Mode string
+func (p *Proxy) getSandboxHostDefinition(r *http.Request) (*sandboxHost, int, error) {
+	start := time.Now()
+	host, status, err := p.doGetSandboxHostDefinition(r)
+	durationMs := float64(time.Since(start)) / float64(time.Millisecond)
 
-const (
-	// ModeHeader is the mode that uses the Host or SandboxIngress header
-	// to determine the sandbox instance.
-	ModeHeader Mode = "header"
+	result := "success"
+	if err != nil {
+		result = routingResultFromErr(err)
+	}
+	telemetry.RecordRouting(result, durationMs)
+	return host, status, err
+}
 
-	// ModeURI is the mode that uses the URI path to determine the
-	// sandbox instance.
-	//
-	// Pattern is 'hostname/<sandbox-id>/<sandbox-port>/<path-to-request>'.
-	ModeURI Mode = "uri"
-)
+func routingResultFromErr(err error) string {
+	if errors.Is(err, sandbox.ErrSandboxNotFound) {
+		return "not_found"
+	}
+	if errors.Is(err, sandbox.ErrSandboxNotReady) {
+		return "not_ready"
+	}
+	return "error"
+}
 
-func (p *Proxy) getSandboxHostDefinition(r *http.Request) (*sandboxHost, error) {
-	switch p.mode {
-	case ModeHeader:
-		targetHost := p.parseTargetHostByHeader(r)
-		if targetHost == "" {
-			return nil, fmt.Errorf("missing header '%s' or 'Host'", SandboxIngress)
+func (p *Proxy) doGetSandboxHostDefinition(r *http.Request) (*sandboxHost, int, error) {
+	pr, status, err := p.parseRequestedRoute(r)
+	if status != 0 {
+		if err == nil {
+			err = errors.New("invalid ingress route")
 		}
-
-		host, err := p.parseSandboxHost(targetHost)
-		if err != nil || host.ingressKey == "" || host.port == 0 {
-			return nil, fmt.Errorf("invalid host: %s", targetHost)
-		}
-		return host, nil
-	case ModeURI:
-		return p.parseSandboxURI(r)
+		return nil, status, err
 	}
 
-	return nil, fmt.Errorf("unknown ingress mode: %s", p.mode)
+	if err != nil || pr.sandboxID == "" || pr.port == 0 {
+		if err == nil {
+			err = errors.New("missing sandbox ID or port")
+		}
+		return nil, ingressRouteErrHTTPStatus(err), fmt.Errorf("invalid ingress route: %w", err)
+	}
+	if _, required := p.sandboxProvider.(sandbox.AuthenticatedRouteProvider); required && pr.namespace == "" {
+		err = fmt.Errorf("%w: Fast Sandbox provider requires an authenticated route scope", routescope.ErrUnauthorized)
+		return nil, ingressRouteErrHTTPStatus(err), err
+	}
+
+	target := sandbox.EndpointTarget{
+		RouteKind: pr.routeKind,
+		Namespace: pr.namespace,
+		SandboxID: pr.sandboxID,
+		Port:      pr.port,
+	}
+	endpoint, err := p.sandboxProvider.ResolveEndpoint(r.Context(), target)
+	if err != nil {
+		// OSEP-0024 wake-on-access: before answering 503 for a fast-sandbox
+		// target, check whether the sandbox is merely paused and park until
+		// it resumes. A nil wake error means the sandbox is ready to serve
+		// and the route is resolved again (the restore invalidated it).
+		if p.waker != nil && pr.routeKind == sandbox.RouteKindFastSandbox && errors.Is(err, sandbox.ErrSandboxNotReady) {
+			if wakeErr := p.waker.Wake(r.Context(), target); wakeErr == nil {
+				endpoint, err = p.sandboxProvider.ResolveEndpoint(r.Context(), target)
+			} else {
+				return nil, httpStatusForWakeErr(wakeErr), &wakeGateError{target: target, err: fmt.Errorf("wake sandbox: %w", wakeErr)}
+			}
+		}
+		if err != nil {
+			return nil, providerErrHTTPStatus(err), err
+		}
+	}
+
+	need := endpoint.AccessVerificationRequired()
+
+	// The sandbox does not require secure access, so a four-segment signed path
+	// must not have its leading segments stripped: re-parse as legacy and keep
+	// the full path for the upstream.
+	if p.mode == ModeURI && !need && pr.signedRoute {
+		pr, err = parseURILegacy(r.URL.Path)
+		if err != nil {
+			return nil, ingressRouteErrHTTPStatus(err), err
+		}
+		pr.requestRawPath = escapedPathSuffix(r.URL.EscapedPath(), 2)
+	}
+
+	present, accessTok := signature.SecureAccessHeaderInfo(r)
+	if err := signature.CheckIngressSecureAccess(signature.IngressAccessInput{
+		Secure:                    need,
+		ExpectedAccessToken:       endpoint.SecureAccessToken,
+		SecureAccessHeaderPresent: present,
+		RequestedAccessToken:      accessTok,
+		ExpiresB36:                pr.expiresB36,
+		Signature:                 pr.signature,
+		SandboxID:                 pr.sandboxID,
+		Port:                      pr.port,
+		Verifier:                  p.secure,
+	}); err != nil {
+		return nil, ingressRouteErrHTTPStatus(err), err
+	}
+
+	return &sandboxHost{
+		routeKind:      pr.routeKind,
+		namespace:      pr.namespace,
+		ingressKey:     pr.sandboxID,
+		port:           pr.port,
+		endpoint:       endpoint.Endpoint,
+		info:           endpoint,
+		requestURI:     pr.requestURI,
+		requestRawPath: pr.requestRawPath,
+	}, 0, nil
+}
+
+func (p *Proxy) parseRequestedRoute(r *http.Request) (parsedRoute, int, error) {
+	switch p.mode {
+	case ModeHeader:
+		return p.parseRequestedHeaderRoute(r)
+	case ModeURI:
+		return p.parseRequestedURIRoute(r)
+	default:
+		return parsedRoute{}, http.StatusBadRequest, fmt.Errorf("unknown ingress mode: %s", p.mode)
+	}
+}
+
+func (p *Proxy) parseRequestedHeaderRoute(r *http.Request) (parsedRoute, int, error) {
+	targetHost := p.parseTargetHostByHeader(r)
+	if targetHost == "" {
+		return parsedRoute{}, http.StatusBadRequest, fmt.Errorf("missing header '%s' or 'Host'", SandboxIngress)
+	}
+	if routescope.IsToken(targetHost) {
+		pr, err := p.parseFastSandboxScope(targetHost, "")
+		return pr, 0, err
+	}
+	pr, err := parseHostRoute(targetHost)
+	return pr, 0, err
+}
+
+func (p *Proxy) parseRequestedURIRoute(r *http.Request) (parsedRoute, int, error) {
+	if r.URL == nil || r.URL.Path == "" {
+		return parsedRoute{}, http.StatusBadRequest, errors.New("missing URI path")
+	}
+	trimmed := strings.TrimPrefix(r.URL.Path, "/")
+	first, rest, found := strings.Cut(trimmed, "/")
+	if routescope.IsToken(first) {
+		requestURI := "/"
+		if found && rest != "" {
+			requestURI += rest
+		}
+		pr, err := p.parseFastSandboxScope(first, requestURI)
+		if err == nil {
+			pr.requestRawPath = escapedPathSuffix(r.URL.EscapedPath(), 1)
+		}
+		return pr, 0, err
+	}
+
+	pr, err := parseURIRoute(r.URL.Path)
+	if err != nil {
+		return pr, 0, err
+	}
+	// Signed routes carry four leading route segments; legacy routes two.
+	if pr.signedRoute {
+		pr.requestRawPath = escapedPathSuffix(r.URL.EscapedPath(), 4)
+	} else {
+		pr.requestRawPath = escapedPathSuffix(r.URL.EscapedPath(), 2)
+	}
+	return pr, 0, nil
+}
+
+func escapedPathSuffix(path string, prefixSegments int) string {
+	trimmed := strings.TrimPrefix(path, "/")
+	for range prefixSegments {
+		_, rest, found := strings.Cut(trimmed, "/")
+		if !found {
+			return "/"
+		}
+		trimmed = rest
+	}
+	if trimmed == "" {
+		return "/"
+	}
+	return "/" + trimmed
+}
+
+func (p *Proxy) parseFastSandboxScope(token, requestURI string) (parsedRoute, error) {
+	if p.scope == nil {
+		return parsedRoute{}, fmt.Errorf("%w: verifier is not configured", routescope.ErrUnauthorized)
+	}
+	scope, err := p.scope.Verify(token)
+	if err != nil {
+		return parsedRoute{}, err
+	}
+	return parsedRoute{
+		routeKind:  sandbox.RouteKindFastSandbox,
+		namespace:  scope.Namespace,
+		sandboxID:  scope.SandboxID,
+		port:       scope.Port,
+		requestURI: requestURI,
+	}, nil
 }
 
 func (p *Proxy) parseTargetHostByHeader(r *http.Request) string {
@@ -70,63 +235,12 @@ func (p *Proxy) parseTargetHostByHeader(r *http.Request) string {
 }
 
 type sandboxHost struct {
-	ingressKey string
-	port       int
-	requestURI string
-}
-
-func (p *Proxy) parseSandboxHost(s string) (*sandboxHost, error) {
-	domain := strings.Split(strings.TrimPrefix(strings.TrimPrefix(s, "https://"), "http://"), ".")
-	if len(domain) < 1 {
-		return &sandboxHost{}, fmt.Errorf("invalid host: %s", s)
-	}
-
-	ingressAndPort := strings.Split(domain[0], "-")
-	if len(ingressAndPort) <= 1 || ingressAndPort[0] == "" {
-		return &sandboxHost{}, fmt.Errorf("invalid host: %s", s)
-	}
-
-	ingress := strings.Join(ingressAndPort[:len(ingressAndPort)-1], "-")
-	port, err := strconv.Atoi(ingressAndPort[len(ingressAndPort)-1])
-	if err != nil {
-		return &sandboxHost{}, fmt.Errorf("invalid port format: %w", err)
-	}
-	return &sandboxHost{ingress, port, ""}, nil
-}
-
-func (p *Proxy) parseSandboxURI(r *http.Request) (*sandboxHost, error) {
-	path := r.URL.Path
-	if path == "" {
-		return nil, errors.New("missing URI path")
-	}
-
-	// Remove leading slash and split by '/'
-	path = strings.TrimPrefix(path, "/")
-	parts := strings.SplitN(path, "/", 3)
-	if len(parts) < 2 {
-		return nil, fmt.Errorf("invalid URI path format: expected '/<sandbox-id>/<sandbox-port>/<path-to-request>', got: %s", r.URL.Path)
-	}
-
-	sandboxID := parts[0]
-	port, err := strconv.Atoi(parts[1])
-	if err != nil {
-		return nil, fmt.Errorf("invalid port format: %w", err)
-	}
-	if sandboxID == "" || port <= 0 {
-		return nil, errors.New("missing sandbox-id or sandbox-port in URI path")
-	}
-
-	// Extract the remaining path (user's target request URI)
-	var requestURI string
-	if len(parts) >= 3 && parts[2] != "" {
-		requestURI = "/" + parts[2]
-	} else {
-		requestURI = "/"
-	}
-
-	return &sandboxHost{
-		ingressKey: sandboxID,
-		port:       port,
-		requestURI: requestURI,
-	}, nil
+	routeKind      sandbox.RouteKind
+	namespace      string
+	ingressKey     string
+	port           int
+	endpoint       string
+	info           *sandbox.EndpointInfo
+	requestURI     string
+	requestRawPath string
 }

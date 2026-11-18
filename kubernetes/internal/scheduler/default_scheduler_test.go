@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,6 +15,8 @@
 package scheduler
 
 import (
+	"context"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -40,6 +42,78 @@ func (m mockLogger) WithValues(keysAndValues ...interface{}) logr.LogSink      {
 func (m mockLogger) WithName(name string) logr.LogSink                         { return m }
 
 var testLogger = logr.New(mockLogger{})
+
+type deadlineRecordingTaskClient struct {
+	hasDeadline bool
+	deadline    time.Time
+}
+
+func (c *deadlineRecordingTaskClient) Set(ctx context.Context, task *api.Task) (*api.Task, error) {
+	c.deadline, c.hasDeadline = ctx.Deadline()
+	return task, nil
+}
+
+func (c *deadlineRecordingTaskClient) Get(context.Context) (*api.Task, error) {
+	return nil, nil
+}
+
+func TestSetTaskUsesPreStartHookTimeoutForDeadline(t *testing.T) {
+	timeoutSeconds := int64(30)
+	client := &deadlineRecordingTaskClient{}
+
+	_, err := setTask(client, &api.Task{
+		Name: "slow-prestart",
+		Process: &api.Process{
+			Command: []string{"echo", "main"},
+			Lifecycle: &api.ProcessLifecycle{
+				PreStart: &api.LifecycleHandler{
+					Exec: &api.ExecAction{
+						Command: []string{"sleep", "20"},
+					},
+					TimeoutSeconds: &timeoutSeconds,
+				},
+			},
+		},
+	}, testLogger)
+
+	if err != nil {
+		t.Fatalf("setTask returned error: %v", err)
+	}
+	if !client.hasDeadline {
+		t.Fatal("setTask should pass a deadline-bound context")
+	}
+	if remaining := time.Until(client.deadline); remaining < 25*time.Second {
+		t.Fatalf("setTask deadline = %v from now, want at least the preStart hook timeout", remaining)
+	}
+}
+
+func TestSetTaskUsesFallbackDeadlineWhenPreStartHookHasNoTimeout(t *testing.T) {
+	client := &deadlineRecordingTaskClient{}
+
+	_, err := setTask(client, &api.Task{
+		Name: "unbounded-prestart",
+		Process: &api.Process{
+			Command: []string{"echo", "main"},
+			Lifecycle: &api.ProcessLifecycle{
+				PreStart: &api.LifecycleHandler{
+					Exec: &api.ExecAction{
+						Command: []string{"sleep", "20"},
+					},
+				},
+			},
+		},
+	}, testLogger)
+
+	if err != nil {
+		t.Fatalf("setTask returned error: %v", err)
+	}
+	if !client.hasDeadline {
+		t.Fatalf("setTask should apply a fallback deadline to an unbounded preStart hook")
+	}
+	if remaining := time.Until(client.deadline); remaining < 30*time.Minute-defaultTimeout {
+		t.Fatalf("setTask deadline = %v from now, want the fallback preStart timeout", remaining)
+	}
+}
 
 func Test_scheduleSingleTaskNode(t *testing.T) {
 	ctl := gomock.NewController(t)
@@ -423,6 +497,48 @@ func Test_refreshFreePods(t *testing.T) {
 			expectedFree:  0,
 			expectedNames: []string{},
 		},
+		{
+			name: "pods explicitly marked NotReady are not free",
+			allPods: []*corev1.Pod{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "pod-ready"},
+					Status:     corev1.PodStatus{PodIP: "1.1.1.1"},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "pod-notready"},
+					Status: corev1.PodStatus{
+						PodIP: "1.1.1.2",
+						Conditions: []corev1.PodCondition{
+							{Type: corev1.PodReady, Status: corev1.ConditionFalse},
+						},
+					},
+				},
+				{
+					// ConditionUnknown means the node is degraded or partitioned
+					// (lease expired, probe undetermined) while the pod may still
+					// hold its IP: kubelet's own verdict, so the pod is blocked.
+					ObjectMeta: metav1.ObjectMeta{Name: "pod-ready-unknown"},
+					Status: corev1.PodStatus{
+						PodIP: "1.1.1.3",
+						Conditions: []corev1.PodCondition{
+							{Type: corev1.PodReady, Status: corev1.ConditionUnknown},
+						},
+					},
+				},
+				{
+					// No PodReady condition at all: readiness simply has not been
+					// observed, which is not a verdict, so the pod stays free.
+					// This is deliberate.
+					ObjectMeta: metav1.ObjectMeta{Name: "pod-unobserved-readiness"},
+					Status:     corev1.PodStatus{PodIP: "1.1.1.4"},
+				},
+			},
+			taskNodes: []*taskNode{
+				{ObjectMeta: metav1.ObjectMeta{Name: "task-1"}},
+			},
+			expectedFree:  2,
+			expectedNames: []string{"pod-ready", "pod-unobserved-readiness"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -631,7 +747,7 @@ func Test_collectTaskStatus(t *testing.T) {
 			// Create mock task status collector
 			mockCollector := NewMocktaskStatusCollector(ctl)
 			if len(tt.expectedCollectIPs) > 0 {
-				mockCollector.EXPECT().Collect(gomock.Any(), tt.expectedCollectIPs).Return(tt.mockReturnTasks).Times(1)
+				mockCollector.EXPECT().Collect(gomock.Any(), tt.expectedCollectIPs).Return(tt.mockReturnTasks, nil).Times(1)
 			}
 
 			// Create scheduler with mock collector
@@ -690,6 +806,119 @@ func Test_collectTaskStatus(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func Test_collectTaskStatus_queryFailure(t *testing.T) {
+	runningTask := &api.Task{
+		Name: "task-1",
+		ProcessStatus: &api.ProcessStatus{
+			Running: &api.Running{StartedAt: metav1.Now()},
+		},
+	}
+	pod := func(name, ip string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Status:     corev1.PodStatus{PodIP: ip},
+		}
+	}
+
+	tests := []struct {
+		name       string
+		allPods    []*corev1.Pod
+		wantStatus *api.Task
+	}{
+		{
+			name:       "pod still exists; keep last known status",
+			allPods:    []*corev1.Pod{pod("pod-1", "1.1.1.1")},
+			wantStatus: runningTask,
+		},
+		{
+			name:       "pod is gone; treat task as deleted",
+			allPods:    nil,
+			wantStatus: nil,
+		},
+		{
+			name:       "pod recreated with a new IP; treat task as deleted",
+			allPods:    []*corev1.Pod{pod("pod-1", "2.2.2.2")},
+			wantStatus: nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctl := gomock.NewController(t)
+			mockCollector := NewMocktaskStatusCollector(ctl)
+			mockCollector.EXPECT().Collect(gomock.Any(), []string{"1.1.1.1"}).
+				Return(map[string]*api.Task{}, errors.New("timeout")).Times(1)
+
+			tNode := &taskNode{
+				ObjectMeta: metav1.ObjectMeta{Name: "task-1"},
+				IP:         "1.1.1.1",
+				PodName:    "pod-1",
+				Status:     runningTask,
+				tState:     RunningTaskState,
+			}
+			sch := &defaultTaskScheduler{
+				allPods:             tt.allPods,
+				taskStatusCollector: mockCollector,
+				logger:              testLogger,
+			}
+
+			sch.collectTaskStatus([]*taskNode{tNode})
+
+			if tNode.Status != tt.wantStatus {
+				t.Errorf("Status = %v, want %v", tNode.Status, tt.wantStatus)
+			}
+			if tNode.tState != RunningTaskState {
+				t.Errorf("tState = %v, want %v", tNode.tState, RunningTaskState)
+			}
+		})
+	}
+}
+
+// A failed status query while a task is being released must not mark it
+// released: the executor still has to be told to stop the task.
+func Test_defaultTaskScheduler_ScheduleKeepsReleasingOnQueryFailure(t *testing.T) {
+	ctl := gomock.NewController(t)
+	mockCollector := NewMocktaskStatusCollector(ctl)
+	mockCollector.EXPECT().Collect(gomock.Any(), []string{"1.1.1.1"}).
+		Return(map[string]*api.Task{}, errors.New("timeout")).Times(1)
+	mockClient := NewMocktaskClient(ctl)
+	mockClient.EXPECT().Set(gomock.Any(), nil).Return(nil, nil).Times(1)
+
+	tNode := &taskNode{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "task-1",
+			DeletionTimestamp: &metav1.Time{Time: time.Now()},
+		},
+		IP:      "1.1.1.1",
+		PodName: "pod-1",
+		Status: &api.Task{
+			Name: "task-1",
+			ProcessStatus: &api.ProcessStatus{
+				Running: &api.Running{StartedAt: metav1.Now()},
+			},
+		},
+		tState: RunningTaskState,
+		sState: stateReleasing,
+	}
+	sch := &defaultTaskScheduler{
+		allPods: []*corev1.Pod{{
+			ObjectMeta: metav1.ObjectMeta{Name: "pod-1"},
+			Status:     corev1.PodStatus{PodIP: "1.1.1.1"},
+		}},
+		taskNodes:           []*taskNode{tNode},
+		maxConcurrency:      1,
+		taskStatusCollector: mockCollector,
+		taskClientCreator:   func(string) taskClient { return mockClient },
+		logger:              testLogger,
+	}
+
+	if err := sch.Schedule(); err != nil {
+		t.Fatalf("Schedule() error = %v", err)
+	}
+	if tNode.sState != stateReleasing {
+		t.Errorf("sState = %q, want %q", tNode.sState, stateReleasing)
 	}
 }
 
@@ -1286,6 +1515,84 @@ func Test_initTaskNodes(t *testing.T) {
 			}
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("initTaskNodes() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_addTasks(t *testing.T) {
+	tests := []struct {
+		name          string
+		initial       []*api.Task
+		addTasks      []*api.Task
+		wantNodeNames []string
+		wantNodeCount int
+	}{
+		{
+			name: "scale-out: new tasks are appended, existing tasks are skipped",
+			initial: []*api.Task{
+				{Name: "sandbox-0", Process: &api.Process{Command: []string{"echo", "0"}}},
+			},
+			addTasks: []*api.Task{
+				{Name: "sandbox-0", Process: &api.Process{Command: []string{"echo", "0"}}},
+				{Name: "sandbox-1", Process: &api.Process{Command: []string{"echo", "1"}}},
+			},
+			wantNodeNames: []string{"sandbox-0", "sandbox-1"},
+			wantNodeCount: 2,
+		},
+		{
+			name: "no-op: add same tasks as already tracked",
+			initial: []*api.Task{
+				{Name: "sandbox-0"},
+				{Name: "sandbox-1"},
+			},
+			addTasks: []*api.Task{
+				{Name: "sandbox-0"},
+				{Name: "sandbox-1"},
+			},
+			wantNodeNames: []string{"sandbox-0", "sandbox-1"},
+			wantNodeCount: 2,
+		},
+		{
+			name:    "empty scheduler: add initial tasks",
+			initial: []*api.Task{},
+			addTasks: []*api.Task{
+				{Name: "sandbox-0"},
+			},
+			wantNodeNames: []string{"sandbox-0"},
+			wantNodeCount: 1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			initialNodes, err := initTaskNodes(tt.initial)
+			if err != nil {
+				t.Fatalf("initTaskNodes() error = %v", err)
+			}
+			sch := &defaultTaskScheduler{
+				taskNodes:           initialNodes,
+				taskNodeByNameIndex: indexByName(initialNodes),
+				logger:              testLogger,
+			}
+
+			if err := sch.AddTasks(tt.addTasks); err != nil {
+				t.Fatalf("AddTasks() unexpected error = %v", err)
+			}
+
+			if len(sch.taskNodes) != tt.wantNodeCount {
+				t.Errorf("AddTasks() taskNodes count = %d, want %d", len(sch.taskNodes), tt.wantNodeCount)
+			}
+
+			nodeNames := make([]string, len(sch.taskNodes))
+			for i, n := range sch.taskNodes {
+				nodeNames[i] = n.Name
+			}
+			if !reflect.DeepEqual(nodeNames, tt.wantNodeNames) {
+				t.Errorf("AddTasks() taskNode names = %v, want %v", nodeNames, tt.wantNodeNames)
+			}
+
+			if len(sch.taskNodeByNameIndex) != tt.wantNodeCount {
+				t.Errorf("AddTasks() taskNodeByNameIndex size = %d, want %d", len(sch.taskNodeByNameIndex), tt.wantNodeCount)
 			}
 		})
 	}

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -265,6 +265,96 @@ PY
 )
 echo "Expiration renewed to: ${renewed}"
 
+curl_patch() {
+  # Like curl_json but dumps response body on HTTP errors for debugging.
+  local result headers http_code
+  result=$(curl -sSL -D /dev/stderr -w "\n%{http_code}" "$@") || true
+  http_code="${result##*$'\n'}"
+  if [[ "${http_code}" -ge 400 ]]; then
+    echo ""
+    echo "PATCH HTTP ${http_code} — response body:" >&2
+    echo "${result%$'\n'*}" >&2
+    return 1
+  fi
+  printf '%s' "${result%$'\n'*}"
+}
+
+step "Patch sandbox metadata — add key"
+patch_resp=$(curl_patch \
+  -X PATCH \
+  -H 'Content-Type: application/json' \
+  -d '{"team": "platform", "version": "2.0"}' \
+  "${BASE_API_URL}/sandboxes/${SANDBOX_ID}/metadata")
+
+python3 - <<'PY' "${patch_resp}" "${SANDBOX_ID}"
+import json,sys
+body=json.loads(sys.argv[1])
+sid=sys.argv[2]
+assert str(body.get("id"))==sid, "Sandbox ID mismatch in PATCH response"
+md=body.get("metadata") or {}
+assert md.get("hello")=="world", f"Expected hello=world, got {md.get('hello')}"
+assert md.get("team")=="platform", f"Expected team=platform, got {md.get('team')}"
+assert md.get("version")=="2.0", f"Expected version=2.0, got {md.get('version')}"
+print("PASS: metadata after add: " + json.dumps(md))
+PY
+info "PATCH add keys OK"
+
+step "Patch sandbox metadata — delete key"
+patch_resp=$(curl_patch \
+  -X PATCH \
+  -H 'Content-Type: application/json' \
+  -d '{"version": null}' \
+  "${BASE_API_URL}/sandboxes/${SANDBOX_ID}/metadata")
+
+python3 - <<'PY' "${patch_resp}" "${SANDBOX_ID}"
+import json,sys
+body=json.loads(sys.argv[1])
+sid=sys.argv[2]
+md=body.get("metadata") or {}
+assert "version" not in md, f"version should be deleted, got {md.get('version')}"
+assert md.get("team")=="platform", f"Expected team=platform, got {md.get('team')}"
+assert md.get("hello")=="world", f"Expected hello=world, got {md.get('hello')}"
+print("PASS: metadata after delete: " + json.dumps(md))
+PY
+info "PATCH delete key OK"
+
+step "Patch sandbox metadata — mixed add and delete"
+patch_resp=$(curl_patch \
+  -X PATCH \
+  -H 'Content-Type: application/json' \
+  -d '{"team": null, "env": "production"}' \
+  "${BASE_API_URL}/sandboxes/${SANDBOX_ID}/metadata")
+
+python3 - <<'PY' "${patch_resp}" "${SANDBOX_ID}"
+import json,sys
+body=json.loads(sys.argv[1])
+sid=sys.argv[2]
+md=body.get("metadata") or {}
+assert "team" not in md, f"team should be deleted, got {md.get('team')}"
+assert md.get("env")=="production", f"Expected env=production, got {md.get('env')}"
+assert md.get("hello")=="world", f"Expected hello=world, got {md.get('hello')}"
+print("PASS: metadata after mixed: " + json.dumps(md))
+PY
+info "PATCH mixed operations OK"
+
+step "Patch sandbox metadata — empty body noop"
+patch_resp=$(curl_patch \
+  -X PATCH \
+  -H 'Content-Type: application/json' \
+  -d '{}' \
+  "${BASE_API_URL}/sandboxes/${SANDBOX_ID}/metadata")
+
+python3 - <<'PY' "${patch_resp}" "${SANDBOX_ID}"
+import json,sys
+body=json.loads(sys.argv[1])
+sid=sys.argv[2]
+md=body.get("metadata") or {}
+assert md.get("hello")=="world", f"Expected hello=world, got {md.get('hello')}"
+assert md.get("env")=="production", f"Expected env=production, got {md.get('env')}"
+print("PASS: empty body noop: " + json.dumps(md))
+PY
+info "PATCH empty body noop OK"
+
 step "Request endpoint on port 8080"
 endpoint_resp=$(curl_json "${BASE_API_URL}/sandboxes/${SANDBOX_ID}/endpoints/8080")
 endpoint=$(python3 - <<'PY' "${endpoint_resp}"
@@ -335,7 +425,6 @@ PY
 fi
 
 step "Create sandbox with host volume mount"
-# Prepare the host volume test directory
 mkdir -p /tmp/opensandbox-e2e/host-volume-test
 echo "opensandbox-e2e-marker" > /tmp/opensandbox-e2e/host-volume-test/marker.txt
 chmod -R 755 /tmp/opensandbox-e2e
@@ -383,8 +472,6 @@ PY
   step "Wait for volume sandbox to reach Running"
   wait_for_running "${VOLUME_SANDBOX_ID}" >/dev/null
 
-  # --- Verify the bind mount is actually effective ---
-  # Resolve the Docker container ID from the sandbox API response.
   volume_sandbox_resp=$(curl_json "${BASE_API_URL}/sandboxes/${VOLUME_SANDBOX_ID}")
   container_id=$(python3 -c '
 import json, sys
@@ -398,7 +485,6 @@ print(body.get("containerId", body.get("container_id", "")), end="")
 
   if [[ -n "${container_id}" ]]; then
     step "Verify host volume bind mount content inside container"
-    # 1. Read the marker file written on the host
     marker_content=$(docker exec "${container_id}" cat /mnt/host-data/marker.txt 2>&1) || true
     if [[ "${marker_content}" == "opensandbox-e2e-marker" ]]; then
       info "PASS: marker.txt content matches expected value."
@@ -407,7 +493,6 @@ print(body.get("containerId", body.get("container_id", "")), end="")
       exit 1
     fi
 
-    # 2. Write a file from inside the container and verify it on the host
     docker exec "${container_id}" sh -c 'echo "written-from-sandbox" > /mnt/host-data/sandbox-output.txt'
     host_content=$(cat /tmp/opensandbox-e2e/host-volume-test/sandbox-output.txt 2>&1) || true
     if [[ "${host_content}" == "written-from-sandbox" ]]; then

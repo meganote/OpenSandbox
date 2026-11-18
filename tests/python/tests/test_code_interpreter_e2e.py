@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,9 +30,9 @@ to make failures easier to locate and debug.
 import asyncio
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import timedelta
-from typing import Awaitable, Callable
 
 import pytest
 from code_interpreter import CodeInterpreter
@@ -50,7 +50,11 @@ from opensandbox.models.execd import (
 )
 from opensandbox.models.sandboxes import Host, SandboxImageSpec, Volume
 
-from tests.base_e2e_test import create_connection_config, get_sandbox_image
+from tests.base_e2e_test import (
+    create_connection_config,
+    get_e2e_sandbox_resource,
+    get_sandbox_image,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -88,14 +92,15 @@ def _assert_terminal_event_contract(
         errors: list[ExecutionError],
         execution_id: str | None,
 ) -> None:
-    # Contract: init must exist, and exactly one of (error, complete) exists.
+    # Contract: init must exist, and at least one terminal signal exists.
+    # For Jupyter-backed code execution, complete and error may coexist.
     assert len(init_events) == 1
     assert init_events[0].id is not None and init_events[0].id.strip()
     if execution_id is not None:
         assert init_events[0].id == execution_id
     _assert_recent_timestamp_ms(init_events[0].timestamp)
     assert (len(completed_events) > 0) or (len(errors) > 0), (
-        f"expected exactly one of complete/error, got complete={len(completed_events)} "
+        f"expected at least one of complete/error, got complete={len(completed_events)} "
         f"error={len(errors)}"
     )
     if len(completed_events) > 0:
@@ -209,14 +214,13 @@ async def run_with_retry(
                 if flush_attempt_events is not None:
                     await flush_attempt_events()
                 return result
-            # Empty result - retry
             if attempt < max_retries - 1:
                 logger.warning(
                     "Execution returned empty result (attempt %d/%d), retrying in %.1fs...",
                     attempt + 1, max_retries, retry_delay
                 )
                 await asyncio.sleep(retry_delay)
-                retry_delay *= 1.5  # exponential backoff
+                retry_delay *= 1.5
         except asyncio.TimeoutError:
             last_exception = TimeoutError(
                 f"codes.run() did not complete within {per_call_timeout}s"
@@ -236,7 +240,6 @@ async def run_with_retry(
         except Exception as e:
             last_exception = e
             error_name = type(e).__name__
-            # Check if it's a retryable network error
             error_str = str(e).lower()
             is_retryable = any(keyword in error_str for keyword in [
                 "disconnected", "connection", "reset", "closed", "timeout",
@@ -250,10 +253,8 @@ async def run_with_retry(
                 await asyncio.sleep(retry_delay)
                 retry_delay *= 1.5
             else:
-                # Non-retryable error or last attempt
                 raise
 
-    # If we have a result (even empty), return it; otherwise raise last exception
     if last_result is not None:
         return last_result
     if last_exception is not None:
@@ -267,7 +268,6 @@ async def create_context_with_retry(
     max_retries: int = 3,
     retry_delay: float = 2.0,
 ):
-    """Create a code context with retry logic for network errors."""
     last_exception = None
     for attempt in range(max_retries):
         try:
@@ -356,6 +356,51 @@ class TestCodeInterpreterE2E:
                 except Exception as e:
                     logger.warning("Teardown: sandbox.close() failed: %s", e, exc_info=True)
 
+    @pytest.fixture
+    async def isolated_code_interpreter(self):
+        """Create an isolated sandbox+interpreter for high-flakiness run tests."""
+        connection_config = create_connection_config()
+        sandbox = await Sandbox.create(
+            image=SandboxImageSpec(get_sandbox_image()),
+            entrypoint=["/opt/code-interpreter/code-interpreter.sh"],
+            connection_config=connection_config,
+            resource=get_e2e_sandbox_resource(),
+            timeout=timedelta(minutes=15),
+            ready_timeout=timedelta(seconds=60),
+            metadata={"tag": "e2e-code-interpreter-isolated"},
+            env={
+                "E2E_TEST": "true",
+                "GO_VERSION": "1.25",
+                "JAVA_VERSION": "21",
+                "NODE_VERSION": "22",
+                "PYTHON_VERSION": "3.12",
+                "EXECD_LOG_FILE": "/tmp/opensandbox-e2e/logs/execd.log",
+                "EXECD_API_GRACE_SHUTDOWN": "3s",
+                "EXECD_JUPYTER_IDLE_POLL_INTERVAL": "200ms",
+            },
+            health_check_polling_interval=timedelta(milliseconds=500),
+            volumes=[
+                Volume(
+                    name="execd-log",
+                    host=Host(path="/tmp/opensandbox-e2e/logs"),
+                    mountPath="/tmp/opensandbox-e2e/logs",
+                    readOnly=False,
+                ),
+            ],
+        )
+        code_interpreter = await CodeInterpreter.create(sandbox=sandbox)
+        try:
+            yield code_interpreter
+        finally:
+            try:
+                await sandbox.kill()
+            except Exception as e:
+                logger.warning("Teardown(isolated): sandbox.kill() failed: %s", e, exc_info=True)
+            try:
+                await sandbox.close()
+            except Exception as e:
+                logger.warning("Teardown(isolated): sandbox.close() failed: %s", e, exc_info=True)
+
     @classmethod
     async def _ensure_code_interpreter_created(cls) -> None:
         """Create CodeInterpreter once and reuse it across ordered tests."""
@@ -370,8 +415,9 @@ class TestCodeInterpreterE2E:
 
         cls.sandbox = await Sandbox.create(
             image=SandboxImageSpec(get_sandbox_image()),
-            entrypoint=["/opt/opensandbox/code-interpreter.sh"],
+            entrypoint=["/opt/code-interpreter/code-interpreter.sh"],
             connection_config=cls.connection_config,
+            resource=get_e2e_sandbox_resource(),
             timeout=timedelta(minutes=15),
             ready_timeout=timedelta(seconds=60),
             metadata={"tag": "e2e-code-interpreter"},
@@ -382,6 +428,8 @@ class TestCodeInterpreterE2E:
                 "NODE_VERSION": "22",
                 "PYTHON_VERSION": "3.12",
                 "EXECD_LOG_FILE": "/tmp/opensandbox-e2e/logs/execd.log",
+                "EXECD_API_GRACE_SHUTDOWN": "3s",
+                "EXECD_JUPYTER_IDLE_POLL_INTERVAL": "200ms",
             },
             health_check_polling_interval=timedelta(milliseconds=500),
             volumes=[
@@ -425,7 +473,10 @@ class TestCodeInterpreterE2E:
 
         info = await code_interpreter.sandbox.get_info()
         assert str(code_interpreter.id) == str(info.id)
-        assert info.status.state == "Running"
+        # FIXME: upstream Kubernetes BatchSandbox lifecycle may still report
+        # "Allocated" after execd health checks already pass. This E2E focuses
+        # on end-to-end usability, so tolerate that transient state here.
+        assert info.status.state in {"Running", "Allocated"}
         logger.info(
             "✓ CodeInterpreter info: state=%s, created=%s",
             info.status.state,
@@ -456,7 +507,6 @@ class TestCodeInterpreterE2E:
             int(metrics.memory_total_in_mib),
         )
 
-        # Renewal through CodeInterpreter (extend expiration time)
         renew_response = await code_interpreter.sandbox.renew(timedelta(minutes=20))
         assert renew_response is not None
         logger.info("✓ CodeInterpreter expiration renewed to %s", renew_response.expires_at)
@@ -471,10 +521,8 @@ class TestCodeInterpreterE2E:
 
     @pytest.mark.timeout(900)
     @pytest.mark.order(2)
-    async def test_02_java_code_execution(self):
-        await self._ensure_code_interpreter_created()
-        code_interpreter = TestCodeInterpreterE2E.code_interpreter
-        assert code_interpreter is not None
+    async def test_02_java_code_execution(self, isolated_code_interpreter: CodeInterpreter):
+        code_interpreter = isolated_code_interpreter
 
         logger.info("=" * 80)
         logger.info("TEST 2: Java code execution")
@@ -541,6 +589,8 @@ class TestCodeInterpreterE2E:
             assert simple_result.id is not None and simple_result.id.strip()
             assert len(simple_result.result) > 0
             assert simple_result.result[0].text == "4"
+            assert simple_result.exit_code is None
+            assert simple_result.complete is not None
 
             _assert_terminal_event_contract(
                 init_events=init_events,
@@ -574,9 +624,10 @@ class TestCodeInterpreterE2E:
             assert var_result.id is not None
             assert len(var_result.result) > 0
             assert var_result.result[0].text == "4"
+            assert var_result.exit_code is None
+            assert var_result.complete is not None
             logger.info("✓ Java variables and state persistence work correctly")
 
-            # Error handling test
             stdout_messages.clear()
             stderr_messages.clear()
             errors.clear()
@@ -592,6 +643,7 @@ class TestCodeInterpreterE2E:
             assert error_result.id is not None and error_result.id.strip()
             assert error_result.error is not None
             assert error_result.error.name == "EvalException"
+            assert error_result.exit_code is None
 
             _assert_terminal_event_contract(
                 init_events=init_events,
@@ -605,17 +657,13 @@ class TestCodeInterpreterE2E:
 
     @pytest.mark.timeout(900)
     @pytest.mark.order(3)
-    async def test_03_python_code_execution(self):
-        await self._ensure_code_interpreter_created()
-        code_interpreter = TestCodeInterpreterE2E.code_interpreter
-        assert code_interpreter is not None
+    async def test_03_python_code_execution(self, isolated_code_interpreter: CodeInterpreter):
+        code_interpreter = isolated_code_interpreter
 
         logger.info("=" * 80)
         logger.info("TEST 3: Python code execution")
         logger.info("=" * 80)
 
-        # New usage: directly pass a language string (ephemeral context).
-        # This validates the `codes.run(..., language=...)` convenience interface.
         # Use retry helper for the first call — kernel initialization can be flaky.
         direct_lang_result = await run_with_retry(
             code_interpreter,
@@ -743,7 +791,6 @@ class TestCodeInterpreterE2E:
             assert any("Sum of list: 15" in m.text for m in stdout_messages)
             logger.info("✓ Python variable persistence across executions works")
 
-            # Error handling
             stdout_messages.clear()
             stderr_messages.clear()
             errors.clear()
@@ -776,10 +823,8 @@ class TestCodeInterpreterE2E:
 
     @pytest.mark.timeout(900)
     @pytest.mark.order(4)
-    async def test_04_go_code_execution(self):
-        await self._ensure_code_interpreter_created()
-        code_interpreter = TestCodeInterpreterE2E.code_interpreter
-        assert code_interpreter is not None
+    async def test_04_go_code_execution(self, isolated_code_interpreter: CodeInterpreter):
+        code_interpreter = isolated_code_interpreter
 
         logger.info("=" * 80)
         logger.info("TEST 4: Go code execution")
@@ -866,7 +911,6 @@ class TestCodeInterpreterE2E:
             assert data_result_go.id is not None
             logger.info("✓ Go data structures and functions work correctly")
 
-            # Compilation error
             stdout_messages.clear()
             errors.clear()
             completed_events.clear()
@@ -893,10 +937,8 @@ class TestCodeInterpreterE2E:
 
     @pytest.mark.timeout(900)
     @pytest.mark.order(5)
-    async def test_05_typescript_code_execution(self):
-        await self._ensure_code_interpreter_created()
-        code_interpreter = TestCodeInterpreterE2E.code_interpreter
-        assert code_interpreter is not None
+    async def test_05_typescript_code_execution(self, isolated_code_interpreter: CodeInterpreter):
+        code_interpreter = isolated_code_interpreter
 
         logger.info("=" * 80)
         logger.info("TEST 5: TypeScript code execution")
@@ -976,7 +1018,6 @@ class TestCodeInterpreterE2E:
             assert types_result_ts.id is not None
             logger.info("✓ TypeScript types and interfaces work correctly")
 
-            # Type error
             stdout_messages.clear()
             errors.clear()
             completed_events.clear()
@@ -1001,10 +1042,10 @@ class TestCodeInterpreterE2E:
 
     @pytest.mark.timeout(900)
     @pytest.mark.order(6)
-    async def test_06_multi_language_support_and_context_isolation(self):
-        await self._ensure_code_interpreter_created()
-        code_interpreter = TestCodeInterpreterE2E.code_interpreter
-        assert code_interpreter is not None
+    async def test_06_multi_language_support_and_context_isolation(
+            self, isolated_code_interpreter: CodeInterpreter
+    ):
+        code_interpreter = isolated_code_interpreter
 
         logger.info("=" * 80)
         logger.info("TEST 6: Multi-language support and context isolation")
@@ -1072,10 +1113,8 @@ class TestCodeInterpreterE2E:
 
     @pytest.mark.timeout(900)
     @pytest.mark.order(7)
-    async def test_07_concurrent_code_execution(self):
-        await self._ensure_code_interpreter_created()
-        code_interpreter = TestCodeInterpreterE2E.code_interpreter
-        assert code_interpreter is not None
+    async def test_07_concurrent_code_execution(self, isolated_code_interpreter: CodeInterpreter):
+        code_interpreter = isolated_code_interpreter
 
         logger.info("=" * 80)
         logger.info("TEST 7: Concurrent code execution")
@@ -1134,10 +1173,8 @@ class TestCodeInterpreterE2E:
 
     @pytest.mark.timeout(900)
     @pytest.mark.order(8)
-    async def test_08_code_execution_interrupt(self):
-        await self._ensure_code_interpreter_created()
-        code_interpreter = TestCodeInterpreterE2E.code_interpreter
-        assert code_interpreter is not None
+    async def test_08_code_execution_interrupt(self, isolated_code_interpreter: CodeInterpreter):
+        code_interpreter = isolated_code_interpreter
 
         logger.info("=" * 80)
         logger.info("TEST 8: Code execution interrupt")

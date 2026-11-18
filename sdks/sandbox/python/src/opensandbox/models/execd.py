@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 
 class OutputMessage(BaseModel):
@@ -82,6 +82,15 @@ class ExecutionError(BaseModel):
         description="Unix timestamp in milliseconds when error occurred"
     )
     traceback: list[str] = Field(default_factory=list, description="Stack trace lines")
+    exit_code: int | None = Field(
+        default=None,
+        description=(
+            "Exit status for CommandExecError or CommandTimeout after a command exits "
+            "non-zero (-1 when terminated by a signal). None when the process failed to "
+            "start, no exit status was observed, or the error is not from a command. "
+            "Also None on servers that predate error.exit_code."
+        ),
+    )
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -108,6 +117,28 @@ class ExecutionLogs(BaseModel):
     def add_stderr(self, message: OutputMessage) -> None:
         """Add a message to standard error log."""
         self.stderr.append(message)
+
+
+def _format_output_messages(
+    messages: list[OutputMessage], *, preserve_fragments: bool = False
+) -> str:
+    """Format command lines or code fragments, normalizing line endings for display."""
+    parts: list[str] = []
+    last_char = ""
+    for message in messages:
+        text = message.text
+        if (
+            not preserve_fragments
+            and text
+            and last_char
+            and last_char not in "\r\n"
+            and text[0] not in "\r\n"
+        ):
+            parts.append("\n")
+        parts.append(text)
+        if text:
+            last_char = text[-1]
+    return "".join(parts).replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")
 
 
 class ExecutionComplete(BaseModel):
@@ -148,15 +179,27 @@ class Execution(BaseModel):
     for all execution-related data that is exposed to users.
     """
 
+    _is_code_execution: bool = PrivateAttr(default=False)
+
     id: str | None = Field(default=None, description="Unique execution identifier")
     execution_count: int | None = Field(
-        default=None, description="Sequential execution counter", alias="execution_count"
+        default=None,
+        description="Sequential execution counter",
+        alias="execution_count",
     )
     result: list["ExecutionResult"] = Field(
         default_factory=list, description="Execution results"
     )
     error: ExecutionError | None = Field(
         default=None, description="Error information if failed"
+    )
+    complete: ExecutionComplete | None = Field(
+        default=None, description="Completion metadata if execution completed"
+    )
+    exit_code: int | None = Field(
+        default=None,
+        description="Command exit code when available",
+        alias="exit_code",
     )
     logs: ExecutionLogs = Field(
         default_factory=ExecutionLogs, description="Output logs"
@@ -165,6 +208,45 @@ class Execution(BaseModel):
     def add_result(self, result: ExecutionResult) -> None:
         """Add a new execution result."""
         self.result.append(result)
+
+    @property
+    def text(self) -> str:
+        """Return combined stdout and result text.
+
+        Includes both stdout log messages and execution results, preserving
+        blank lines while normalizing line endings for display.
+        """
+        chunks: list[str] = []
+
+        stdout_text = _format_output_messages(
+            self.logs.stdout, preserve_fragments=self._is_code_execution
+        )
+        if stdout_text:
+            chunks.append(stdout_text)
+
+        for res in self.result:
+            if res.text:
+                chunks.append(res.text.rstrip("\n"))
+
+        return "\n".join(chunks)
+
+    def __str__(self) -> str:
+        """Return a human-readable summary of the execution."""
+        parts: list[str] = []
+
+        if self.logs.stdout or self.result:
+            parts.append(self.text)
+
+        if self.logs.stderr:
+            stderr_text = _format_output_messages(
+                self.logs.stderr, preserve_fragments=self._is_code_execution
+            )
+            parts.append(f"[stderr]\n{stderr_text}")
+
+        if self.error:
+            parts.append(f"[error] {self.error.name}: {self.error.value}")
+
+        return "\n".join(parts)
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -187,9 +269,12 @@ class ExecutionHandlers(BaseModel):
             # Can perform async operations
             await log_to_database(msg.text)
 
+        async def handle_stderr(msg: OutputMessage):
+            print(f"Error: {msg.text}")
+
         handlers = ExecutionHandlers(
             on_stdout=handle_stdout,
-            on_stderr=lambda msg: print(f"Error: {msg.text}"),
+            on_stderr=handle_stderr,
         )
         ```
     """
@@ -214,6 +299,12 @@ class ExecutionHandlers(BaseModel):
     on_init: AsyncOutputHandler | None = Field(
         default=None, description="Async handler for execution init"
     )
+    skip_accumulation: bool = Field(
+        default=False,
+        description="When True, stdout/stderr messages are only delivered to handlers "
+        "without being accumulated in ExecutionLogs. Use for long-running "
+        "executions to prevent unbounded memory growth.",
+    )
 
     model_config = ConfigDict(populate_by_name=True, arbitrary_types_allowed=True)
 
@@ -222,6 +313,7 @@ class RunCommandOpts(BaseModel):
     """
     Parameters for command execution.
     """
+
     background: bool = Field(
         default=False, description="Whether to run in background (detached)"
     )
@@ -266,11 +358,15 @@ class CommandStatus(BaseModel):
 
     id: str | None = Field(default=None, description="Command ID")
     content: str | None = Field(default=None, description="Original command content")
-    running: bool | None = Field(default=None, description="True if command is still running")
+    running: bool | None = Field(
+        default=None, description="True if command is still running"
+    )
     exit_code: int | None = Field(
         default=None, description="Exit code if the command has finished"
     )
-    error: str | None = Field(default=None, description="Error message if the command failed")
+    error: str | None = Field(
+        default=None, description="Error message if the command failed"
+    )
     started_at: datetime | None = Field(
         default=None, description="Command start time (RFC3339)", alias="started_at"
     )

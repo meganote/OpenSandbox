@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,24 +17,41 @@
 Synchronous command adapter implementation (including SSE streaming).
 """
 
-import json
 import logging
+from datetime import timedelta
 
 import httpx
 
-from opensandbox.adapters.converter.event_node import EventNode
+from opensandbox._httpx import build_redirect_client_options
+from opensandbox.adapters.converter.command_execution import (
+    build_run_command_request_body as _build_run_command_request_body,
+)
+from opensandbox.adapters.converter.command_execution import (
+    build_run_in_session_request_body as _build_run_in_session_request_body,
+)
+from opensandbox.adapters.converter.command_execution import (
+    decode_sse_event_data as _decode_sse_event_data,
+)
+from opensandbox.adapters.converter.command_execution import (
+    infer_foreground_exit_code as _infer_foreground_exit_code,
+)
+from opensandbox.adapters.converter.command_execution import (
+    resolve_run_in_session_timeout as _resolve_run_in_session_timeout,
+)
+from opensandbox.adapters.converter.env_entry import (
+    build_set_env_command,
+    raise_for_set_env_failure,
+)
 from opensandbox.adapters.converter.exception_converter import (
     ExceptionConverter,
 )
-from opensandbox.adapters.converter.execution_converter import (
-    ExecutionConverter,
-)
 from opensandbox.adapters.converter.response_handler import (
-    extract_request_id,
+    build_api_exception_from_httpx,
     handle_api_error,
 )
+from opensandbox.adapters.sse import iter_sse_events
 from opensandbox.config.connection_sync import ConnectionConfigSync
-from opensandbox.exceptions import InvalidArgumentException, SandboxApiException
+from opensandbox.exceptions import InvalidArgumentException
 from opensandbox.models.execd import (
     CommandLogs,
     CommandStatus,
@@ -47,6 +64,7 @@ from opensandbox.sync.adapters.converter.execution_event_dispatcher import (
     ExecutionEventDispatcherSync,
 )
 from opensandbox.sync.services.command import CommandsSync
+from opensandbox.transport import sse_timeout, streaming_transport
 
 logger = logging.getLogger(__name__)
 
@@ -60,8 +78,12 @@ class CommandsAdapterSync(CommandsSync):
     """
 
     RUN_COMMAND_PATH = "/command"
+    SESSION_PATH = "/session"
+    RUN_IN_SESSION_PATH = "/session/{session_id}/run"
 
-    def __init__(self, connection_config: ConnectionConfigSync, execd_endpoint: SandboxEndpoint) -> None:
+    def __init__(
+        self, connection_config: ConnectionConfigSync, execd_endpoint: SandboxEndpoint
+    ) -> None:
         """
         Initialize the command adapter (sync).
 
@@ -78,88 +100,118 @@ class CommandsAdapterSync(CommandsSync):
         timeout_seconds = self.connection_config.request_timeout.total_seconds()
         timeout = httpx.Timeout(timeout_seconds)
 
-        headers = {
-            "User-Agent": self.connection_config.user_agent,
-            **self.connection_config.headers,
-            **self.execd_endpoint.headers,
-        }
+        headers = self.execd_endpoint.build_request_headers(self.connection_config)
 
-        self._client = Client(base_url=base_url, timeout=timeout)
+        self._client = Client(
+            base_url=base_url,
+            timeout=timeout,
+            follow_redirects=self.connection_config.follow_redirects,
+        )
 
         self._httpx_client = httpx.Client(
             base_url=base_url,
             headers=headers,
             timeout=timeout,
             transport=self.connection_config.transport,
+            **build_redirect_client_options(self.connection_config, base_url),
         )
         self._client.set_httpx_client(self._httpx_client)
 
-        # SSE client (read timeout disabled); endpoint headers already in headers
+        # SSE client: read timeout bounds the wait for response headers and the gap
+        # between stream bytes (see sse_timeout); endpoint headers already in headers
         sse_headers = {
             **headers,
             "Accept": "text/event-stream",
             "Cache-Control": "no-cache",
         }
+        # SSE bootstraps keep only the wake-timeout retry: a non-idempotent
+        # status opt-in would cause duplicate execution on a resent SSE POST.
         self._sse_client = httpx.Client(
             headers=sse_headers,
-            timeout=httpx.Timeout(
-                connect=timeout_seconds,
-                read=None,
-                write=timeout_seconds,
-                pool=None,
-            ),
-            transport=self.connection_config.transport,
+            timeout=sse_timeout(timeout_seconds),
+            transport=streaming_transport(self.connection_config.transport),
+            **build_redirect_client_options(self.connection_config, base_url),
         )
 
     def _get_execd_url(self, path: str) -> str:
         """Build URL for execd endpoint."""
-        return f"{self.connection_config.protocol}://{self.execd_endpoint.endpoint}{path}"
+        return (
+            f"{self.connection_config.protocol}://{self.execd_endpoint.endpoint}{path}"
+        )
+
+    def _execute_streaming_request(
+        self,
+        *,
+        url: str,
+        json_body: dict,
+        handlers: ExecutionHandlersSync | None,
+        infer_exit_code: bool,
+        failure_message: str,
+        is_background: bool = False,
+    ) -> Execution:
+        execution = Execution(id=None, execution_count=None, result=[], error=None)
+        dispatcher = ExecutionEventDispatcherSync(execution, handlers)
+
+        with self._sse_client.stream("POST", url, json=json_body) as response:
+            if response.status_code != 200:
+                response.read()
+                raise build_api_exception_from_httpx(response, failure_message)
+
+            for event in iter_sse_events(response):
+                event_node = _decode_sse_event_data(event.data)
+                if event_node is None:
+                    continue
+                dispatcher.dispatch(event_node)
+                # Foreground responses drain to EOF (no break below): older
+                # servers may emit trailing output after the completion event.
+                if is_background and event_node.type == "execution_complete":
+                    # Background commands are done once execution_complete
+                    # arrives; do not wait for the chunked terminator, which
+                    # older execd versions delay with a grace-period sleep and can
+                    # be lost if the connection is closed early (#1528).
+                    break
+
+        if infer_exit_code:
+            execution.exit_code = _infer_foreground_exit_code(execution)
+
+        return execution
 
     def run(
         self,
-        command: str,
+        command: str | list[str],
         *,
         opts: RunCommandOpts | None = None,
         handlers: ExecutionHandlersSync | None = None,
     ) -> Execution:
-        if not command.strip():
+        if isinstance(command, str) and not command.strip():
             raise InvalidArgumentException("Command cannot be empty")
 
         try:
             opts = opts or RunCommandOpts()
-            json_body = ExecutionConverter.to_api_run_command_json(command, opts)
+            json_body = _build_run_command_request_body(command, opts).to_dict()
             url = self._get_execd_url(self.RUN_COMMAND_PATH)
-
-            execution = Execution(id=None, execution_count=None, result=[], error=None)
-            dispatcher = ExecutionEventDispatcherSync(execution, handlers)
-
-            with self._sse_client.stream("POST", url, json=json_body) as response:
-                if response.status_code != 200:
-                    response.read()
-                    raise SandboxApiException(
-                        message=f"Failed to run command. Status code: {response.status_code}",
-                        status_code=response.status_code,
-                        request_id=extract_request_id(response.headers),
-                    )
-
-                for line in response.iter_lines():
-                    if not line or not line.strip():
-                        continue
-                    data = line
-                    if data.startswith("data:"):
-                        data = data[5:].strip()
-                    try:
-                        event_dict = json.loads(data)
-                        event_node = EventNode(**event_dict)
-                        dispatcher.dispatch(event_node)
-                    except Exception as e:
-                        logger.error("Failed to parse SSE line: %s", line, exc_info=e)
-
-            return execution
+            return self._execute_streaming_request(
+                url=url,
+                json_body=json_body,
+                handlers=handlers,
+                infer_exit_code=not opts.background,
+                failure_message="Failed to run command",
+                is_background=opts.background,
+            )
 
         except Exception as e:
-            logger.error("Failed to run command (length: %s)", len(command), exc_info=e)
+            logger.error("Failed to run command", exc_info=e)
             raise ExceptionConverter.to_sandbox_exception(e) from e
+
+    def set_env(self, key: str, value: str) -> None:
+        """Persist an environment variable for future commands and sessions."""
+        command = build_set_env_command(key, value)
+        try:
+            execution = self.run(command)
+        except Exception as e:
+            logger.error("Failed to run command", exc_info=e)
+            raise ExceptionConverter.to_sandbox_exception(e) from e
+        raise_for_set_env_failure(key, execution)
 
     def interrupt(self, execution_id: str) -> None:
         """
@@ -171,7 +223,9 @@ class CommandsAdapterSync(CommandsSync):
         try:
             from opensandbox.api.execd.api.command import interrupt_command
 
-            response_obj = interrupt_command.sync_detailed(client=self._client, id=execution_id)
+            response_obj = interrupt_command.sync_detailed(
+                client=self._client, id=execution_id
+            )
             handle_api_error(response_obj, "Interrupt command")
         except Exception as e:
             logger.error("Failed to interrupt command", exc_info=e)
@@ -192,7 +246,9 @@ class CommandsAdapterSync(CommandsSync):
                 id=execution_id,
             )
             handle_api_error(response_obj, "Get command status")
-            parsed = require_parsed(response_obj, CommandStatusResponse, "Get command status")
+            parsed = require_parsed(
+                response_obj, CommandStatusResponse, "Get command status"
+            )
             return to_command_status(parsed)
         except Exception as e:
             logger.error("Failed to get command status", exc_info=e)
@@ -224,4 +280,73 @@ class CommandsAdapterSync(CommandsSync):
             return CommandLogs(content=content, cursor=next_cursor)
         except Exception as e:
             logger.error("Failed to get command logs", exc_info=e)
+            raise ExceptionConverter.to_sandbox_exception(e) from e
+
+    def create_session(self, *, working_directory: str | None = None) -> str:
+        from opensandbox.adapters.converter.response_handler import require_parsed
+        from opensandbox.api.execd.api.command import create_session
+        from opensandbox.api.execd.models.create_session_request import (
+            CreateSessionRequest,
+        )
+        from opensandbox.api.execd.models.create_session_response import (
+            CreateSessionResponse,
+        )
+        from opensandbox.api.execd.types import UNSET
+
+        body = (
+            CreateSessionRequest(cwd=working_directory) if working_directory else UNSET
+        )
+        try:
+            response_obj = create_session.sync_detailed(client=self._client, body=body)
+            handle_api_error(response_obj, "create_session")
+            parsed = require_parsed(
+                response_obj, CreateSessionResponse, "create_session"
+            )
+            return parsed.session_id
+        except Exception as e:
+            raise ExceptionConverter.to_sandbox_exception(e) from e
+
+    def run_in_session(
+        self,
+        session_id: str,
+        command: str,
+        *,
+        working_directory: str | None = None,
+        timeout: timedelta | None = None,
+        handlers: ExecutionHandlersSync | None = None,
+    ) -> Execution:
+        if not (session_id and session_id.strip()):
+            raise InvalidArgumentException("session_id cannot be empty")
+        if not (command and command.strip()):
+            raise InvalidArgumentException("command cannot be empty")
+
+        timeout_ms = _resolve_run_in_session_timeout(timeout)
+        body = _build_run_in_session_request_body(
+            command, working_directory, timeout_ms
+        )
+        url = self._get_execd_url(
+            self.RUN_IN_SESSION_PATH.format(session_id=session_id)
+        )
+        try:
+            return self._execute_streaming_request(
+                url=url,
+                json_body=body.to_dict(),
+                handlers=handlers,
+                infer_exit_code=True,
+                failure_message="run_in_session failed",
+            )
+        except Exception as e:
+            raise ExceptionConverter.to_sandbox_exception(e) from e
+
+    def delete_session(self, session_id: str) -> None:
+        if not (session_id and session_id.strip()):
+            raise InvalidArgumentException("session_id cannot be empty")
+        from opensandbox.api.execd.api.command import delete_session
+
+        try:
+            response_obj = delete_session.sync_detailed(
+                client=self._client, session_id=session_id
+            )
+            handle_api_error(response_obj, "delete_session")
+        except Exception as e:
             raise ExceptionConverter.to_sandbox_exception(e) from e

@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,32 +12,59 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Command execution commands: run, status, logs, interrupt + top-level exec alias."""
+"""Command execution commands: one interface, foreground stream or background tracking."""
 
 from __future__ import annotations
 
 import shlex
 import sys
+from collections.abc import Callable
 from datetime import timedelta
 
 import click
-
-from opensandbox.models.execd import OutputMessage, RunCommandOpts
+from opensandbox.models.execd import Execution, OutputMessage, RunCommandOpts
 from opensandbox.models.execd_sync import ExecutionHandlersSync
 
 from opensandbox_cli.client import ClientContext
-from opensandbox_cli.utils import DURATION, handle_errors
+from opensandbox_cli.utils import (
+    DURATION,
+    handle_errors,
+    output_option,
+    prepare_output,
+)
 
 
 @click.group("command", invoke_without_command=True)
 @click.pass_context
 def command_group(ctx: click.Context) -> None:
-    """Execute commands in a sandbox."""
+    """⚡ Execute commands in a sandbox."""
     if ctx.invoked_subcommand is None:
         click.echo(ctx.get_help())
 
 
-# ---- run ------------------------------------------------------------------
+def _stream_handlers() -> tuple[ExecutionHandlersSync, Callable[[], None]]:
+    """Create stdout/stderr streaming handlers and a trailing-newline flusher."""
+    last_text = ""
+
+    def on_stdout(msg: OutputMessage) -> None:
+        nonlocal last_text
+        last_text = msg.text
+        sys.stdout.write(msg.text)
+        sys.stdout.flush()
+
+    def on_stderr(msg: OutputMessage) -> None:
+        nonlocal last_text
+        last_text = msg.text
+        sys.stderr.write(msg.text)
+        sys.stderr.flush()
+
+    def flush_newline() -> None:
+        if last_text and not last_text.endswith("\n"):
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
+    return ExecutionHandlersSync(on_stdout=on_stdout, on_stderr=on_stderr), flush_newline
+
 
 def _run_command(
     obj: ClientContext,
@@ -46,9 +73,23 @@ def _run_command(
     background: bool,
     workdir: str | None,
     timeout: timedelta | None,
+    output_format: str | None,
+    argv: bool = False,
 ) -> None:
-    """Shared implementation for 'command run' and top-level 'exec'."""
-    cmd_str = " ".join(shlex.quote(arg) for arg in command)
+    """Shared implementation for ``command run``.
+
+    Foreground mode streams output and allows only ``-o raw``; background mode
+    returns a tracked execution object and allows structured output. ``--argv``
+    sends the payload as a literal argv list instead of a joined shell command.
+    """
+    allowed = ("table", "json", "yaml") if background else ("raw",)
+    fallback = "table" if background else "raw"
+    prepare_output(obj, output_format, allowed=allowed, fallback=fallback)
+    payload: str | list[str]
+    if argv:
+        payload = list(command)
+    else:
+        payload = " ".join(shlex.quote(arg) for arg in command)
     sandbox = obj.connect_sandbox(sandbox_id)
 
     try:
@@ -59,46 +100,73 @@ def _run_command(
         )
 
         if background:
-            execution = sandbox.commands.run(cmd_str, opts=opts)
-            obj.output.print_dict(
+            execution = sandbox.commands.run(payload, opts=opts)
+            _handle_execution_error(obj, execution, background=True)
+            obj.output.success_panel(
                 {
                     "execution_id": execution.id,
                     "sandbox_id": sandbox_id,
-                    "background": True,
+                    "mode": "background",
                 },
-                title="Background Command",
+                title="Background Command Started",
             )
             return
 
-        # Foreground: stream stdout/stderr to terminal
-        def on_stdout(msg: OutputMessage) -> None:
-            sys.stdout.write(msg.text)
-            sys.stdout.flush()
-
-        def on_stderr(msg: OutputMessage) -> None:
-            sys.stderr.write(msg.text)
-            sys.stderr.flush()
-
-        handlers = ExecutionHandlersSync(on_stdout=on_stdout, on_stderr=on_stderr)
-        execution = sandbox.commands.run(cmd_str, opts=opts, handlers=handlers)
-
-        if execution.error:
-            click.secho(
-                f"\nExecution error: {execution.error.name}: {execution.error.value}",
-                fg="red",
-                err=True,
-            )
-            sys.exit(1)
+        handlers, flush_newline = _stream_handlers()
+        execution = sandbox.commands.run(payload, opts=opts, handlers=handlers)
+        flush_newline()
+        _handle_execution_error(obj, execution)
     finally:
         sandbox.close()
 
 
-@command_group.command("run")
+def _handle_execution_error(
+    obj: ClientContext, execution: Execution, *, background: bool = False
+) -> None:
+    """Exit non-zero on execution errors or missing completion/startup confirmation."""
+    if execution.error:
+        obj.output.error_panel(
+            f"{execution.error.name}: {execution.error.value}",
+            title="Execution Error",
+        )
+        sys.exit(1)
+    if execution.complete is None:
+        confirmation = (
+            "background command startup was confirmed" if background else "the command finished"
+        )
+        obj.output.error_panel(
+            f"The output stream ended before {confirmation}, so its result is unknown.",
+            title="Execution Incomplete",
+        )
+        sys.exit(1)
+
+
+@command_group.command(
+    "run",
+    help="Run a command in a sandbox. Use `--` before the sandbox command payload.",
+    epilog=(
+        "Separator rule: use `--` before the sandbox command payload.\n\n"
+        "By default each payload word is quoted as a single shell token and "
+        "the tokens are joined into one shell command line, so shell syntax "
+        "such as redirects or pipes must ride inside an explicit word "
+        "(for example: -- sh -c 'echo hi > /tmp/x'). Add `--argv` to pass "
+        "the arguments to the executable as-is (no shell), so literal "
+        "`$HOME`, quotes, and empty strings are preserved; this needs a "
+        "sandbox image whose execd accepts argv requests."
+    ),
+)
 @click.argument("sandbox_id")
 @click.argument("command", nargs=-1, required=True)
 @click.option("-d", "--background", is_flag=True, default=False, help="Run in background.")
 @click.option("-w", "--workdir", default=None, help="Working directory.")
 @click.option("-t", "--timeout", type=DURATION, default=None, help="Command timeout (e.g. 30s, 5m).")
+@click.option(
+    "--argv",
+    is_flag=True,
+    default=False,
+    help="Pass the payload as a literal argv list (no shell). Requires an argv-capable execd.",
+)
+@output_option("table", "json", "yaml", "raw")
 @click.pass_obj
 @handle_errors
 def command_run(
@@ -108,20 +176,41 @@ def command_run(
     background: bool,
     workdir: str | None,
     timeout: timedelta | None,
+    argv: bool,
+    output_format: str | None,
 ) -> None:
-    """Run a command in a sandbox."""
-    _run_command(obj, sandbox_id, command, background, workdir, timeout)
+    """Run a command in a sandbox.
 
+    Default mode streams output directly. Add ``--background`` to return a
+    tracked execution object instead. Use ``--`` before the sandbox command payload.
+    The payload is sent as a shell command string unless ``--argv`` is given.
+    """
+    _run_command(
+        obj,
+        sandbox_id,
+        command,
+        background,
+        workdir,
+        timeout,
+        output_format,
+        argv=argv,
+    )
 
-# ---- status ---------------------------------------------------------------
 
 @command_group.command("status")
 @click.argument("sandbox_id")
 @click.argument("execution_id")
+@output_option("table", "json", "yaml")
 @click.pass_obj
 @handle_errors
-def command_status(obj: ClientContext, sandbox_id: str, execution_id: str) -> None:
+def command_status(
+    obj: ClientContext,
+    sandbox_id: str,
+    execution_id: str,
+    output_format: str | None,
+) -> None:
     """Get command execution status."""
+    prepare_output(obj, output_format, allowed=("table", "json", "yaml"), fallback="table")
     sandbox = obj.connect_sandbox(sandbox_id)
     try:
         status = sandbox.commands.get_command_status(execution_id)
@@ -130,63 +219,157 @@ def command_status(obj: ClientContext, sandbox_id: str, execution_id: str) -> No
         sandbox.close()
 
 
-# ---- logs -----------------------------------------------------------------
-
 @command_group.command("logs")
 @click.argument("sandbox_id")
 @click.argument("execution_id")
 @click.option("--cursor", type=int, default=None, help="Cursor for incremental reads.")
+@output_option("table", "json", "yaml", "raw")
 @click.pass_obj
 @handle_errors
 def command_logs(
-    obj: ClientContext, sandbox_id: str, execution_id: str, cursor: int | None
+    obj: ClientContext,
+    sandbox_id: str,
+    execution_id: str,
+    cursor: int | None,
+    output_format: str | None,
 ) -> None:
     """Get background command logs."""
+    prepare_output(
+        obj, output_format, allowed=("table", "json", "yaml", "raw"), fallback="table"
+    )
     sandbox = obj.connect_sandbox(sandbox_id)
     try:
         logs = sandbox.commands.get_background_command_logs(execution_id, cursor=cursor)
         if obj.output.fmt in ("json", "yaml"):
             obj.output.print_model(logs, title="Command Logs")
-        else:
+        elif obj.output.fmt == "raw":
             click.echo(logs.content)
+        else:
+            # The next cursor is the only way to continue an incremental read.
+            obj.output.print_dict({"cursor": logs.cursor}, title="Command Logs")
+            obj.output.panel(logs.content, title="Content")
     finally:
         sandbox.close()
 
-
-# ---- interrupt ------------------------------------------------------------
 
 @command_group.command("interrupt")
 @click.argument("sandbox_id")
 @click.argument("execution_id")
+@output_option("table", "json", "yaml")
 @click.pass_obj
 @handle_errors
-def command_interrupt(obj: ClientContext, sandbox_id: str, execution_id: str) -> None:
+def command_interrupt(
+    obj: ClientContext,
+    sandbox_id: str,
+    execution_id: str,
+    output_format: str | None,
+) -> None:
     """Interrupt a running command."""
+    prepare_output(obj, output_format, allowed=("table", "json", "yaml"), fallback="table")
     sandbox = obj.connect_sandbox(sandbox_id)
     try:
         sandbox.commands.interrupt(execution_id)
-        click.echo(f"Interrupted: {execution_id}")
+        obj.output.success(f"Interrupted: {execution_id}")
     finally:
         sandbox.close()
 
 
-# ---- top-level exec alias ------------------------------------------------
+@command_group.group("session", invoke_without_command=True)
+@click.pass_context
+def session_group(ctx: click.Context) -> None:
+    """Manage persistent bash sessions."""
+    if ctx.invoked_subcommand is None:
+        click.echo(ctx.get_help())
 
-@click.command("exec")
+
+@session_group.command("create")
 @click.argument("sandbox_id")
-@click.argument("command", nargs=-1, required=True)
-@click.option("-d", "--background", is_flag=True, default=False, help="Run in background.")
-@click.option("-w", "--workdir", default=None, help="Working directory.")
-@click.option("-t", "--timeout", type=DURATION, default=None, help="Command timeout (e.g. 30s, 5m).")
+@click.option("-w", "--workdir", default=None, help="Initial working directory.")
+@output_option("table", "json", "yaml")
 @click.pass_obj
 @handle_errors
-def exec_cmd(
+def session_create(
     obj: ClientContext,
     sandbox_id: str,
+    workdir: str | None,
+    output_format: str | None,
+) -> None:
+    """Create a persistent bash session."""
+    prepare_output(obj, output_format, allowed=("table", "json", "yaml"), fallback="table")
+    sandbox = obj.connect_sandbox(sandbox_id)
+    try:
+        session_id = sandbox.commands.create_session(working_directory=workdir)
+        obj.output.success_panel(
+            {
+                "sandbox_id": sandbox.id,
+                "session_id": session_id,
+                "working_directory": workdir,
+            },
+            title="Session Created",
+        )
+    finally:
+        sandbox.close()
+
+
+@session_group.command(
+    "run",
+    help="Run a command in an existing bash session. Use `--` before the sandbox command payload.",
+    epilog="Separator rule: use `--` before the sandbox command payload.",
+)
+@click.argument("sandbox_id")
+@click.argument("session_id")
+@click.argument("command", nargs=-1, required=True)
+@click.option("-w", "--workdir", default=None, help="Working directory override for this run.")
+@click.option("-t", "--timeout", type=DURATION, default=None, help="Command timeout (e.g. 30s, 5m).")
+@output_option("raw", help_text="Output format: raw.")
+@click.pass_obj
+@handle_errors
+def session_run(
+    obj: ClientContext,
+    sandbox_id: str,
+    session_id: str,
     command: tuple[str, ...],
-    background: bool,
     workdir: str | None,
     timeout: timedelta | None,
+    output_format: str | None,
 ) -> None:
-    """Execute a command in a sandbox (shortcut for 'command run')."""
-    _run_command(obj, sandbox_id, command, background, workdir, timeout)
+    """Run a command in an existing bash session. Use `--` before the sandbox command payload."""
+    prepare_output(obj, output_format, allowed=("raw",), fallback="raw")
+    cmd_str = " ".join(shlex.quote(arg) for arg in command)
+    sandbox = obj.connect_sandbox(sandbox_id)
+    try:
+        handlers, flush_newline = _stream_handlers()
+        execution = sandbox.commands.run_in_session(
+            session_id,
+            cmd_str,
+            working_directory=workdir,
+            timeout=timeout,
+            handlers=handlers,
+        )
+        flush_newline()
+        _handle_execution_error(obj, execution)
+    finally:
+        sandbox.close()
+
+
+@session_group.command("delete")
+@click.argument("sandbox_id")
+@click.argument("session_id")
+@output_option("table", "json", "yaml")
+@click.pass_obj
+@handle_errors
+def session_delete(
+    obj: ClientContext,
+    sandbox_id: str,
+    session_id: str,
+    output_format: str | None,
+) -> None:
+    """Delete a persistent bash session."""
+    prepare_output(obj, output_format, allowed=("table", "json", "yaml"), fallback="table")
+    sandbox = obj.connect_sandbox(sandbox_id)
+    try:
+        sandbox.commands.delete_session(session_id)
+        obj.output.success(f"Deleted session: {session_id}")
+    finally:
+        sandbox.close()
+

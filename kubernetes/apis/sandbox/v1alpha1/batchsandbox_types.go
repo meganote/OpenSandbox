@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,6 +19,67 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtime "k8s.io/apimachinery/pkg/runtime"
 )
+
+// +kubebuilder:validation:Enum=Pending;Succeed;Pausing;Paused;Resuming;Failed
+// BatchSandboxPhase defines the overall phase of a BatchSandbox.
+type BatchSandboxPhase string
+
+const (
+	BatchSandboxPhasePending  BatchSandboxPhase = "Pending"
+	BatchSandboxPhaseSucceed  BatchSandboxPhase = "Succeed"
+	BatchSandboxPhasePausing  BatchSandboxPhase = "Pausing"
+	BatchSandboxPhasePaused   BatchSandboxPhase = "Paused"
+	BatchSandboxPhaseResuming BatchSandboxPhase = "Resuming"
+	BatchSandboxPhaseFailed   BatchSandboxPhase = "Failed"
+)
+
+// ConditionStatus represents the status of a condition
+// +kubebuilder:validation:Enum=True;False
+const (
+	ConditionTrue  = "True"
+	ConditionFalse = "False"
+)
+
+// BatchSandboxConditionType represents the type of BatchSandbox condition.
+// +kubebuilder:validation:Enum=Ready;Progressing;Paused;PauseFailed;ResumeFailed;PodFailed;PoolAllocationPending
+type BatchSandboxConditionType string
+
+const (
+	// BatchSandboxConditionReady reflects whether the sandbox is currently available.
+	BatchSandboxConditionReady BatchSandboxConditionType = "Ready"
+	// BatchSandboxConditionProgressing reflects whether the sandbox is transitioning between states.
+	BatchSandboxConditionProgressing BatchSandboxConditionType = "Progressing"
+	// BatchSandboxConditionPaused reflects whether the sandbox is fully paused.
+	BatchSandboxConditionPaused BatchSandboxConditionType = "Paused"
+	// BatchSandboxConditionPauseFailed is set when pause operation fails
+	BatchSandboxConditionPauseFailed BatchSandboxConditionType = "PauseFailed"
+	// BatchSandboxConditionResumeFailed is set when resume operation fails
+	BatchSandboxConditionResumeFailed BatchSandboxConditionType = "ResumeFailed"
+	// BatchSandboxConditionPodFailed is set when the sandbox pod enters a failed state.
+	BatchSandboxConditionPodFailed BatchSandboxConditionType = "PodFailed"
+	// BatchSandboxConditionPoolAllocationPending is set while Pool capacity prevents allocation.
+	BatchSandboxConditionPoolAllocationPending BatchSandboxConditionType = "PoolAllocationPending"
+)
+
+// BatchSandboxCondition represents a condition of a BatchSandbox
+type BatchSandboxCondition struct {
+	// Type is the condition type
+	// +kubebuilder:validation:Required
+	Type BatchSandboxConditionType `json:"type"`
+	// Status is the condition status
+	// +kubebuilder:validation:Enum=True;False
+	// +kubebuilder:validation:Required
+	Status string `json:"status"`
+	// Reason is a brief reason for the condition
+	// +optional
+	Reason string `json:"reason,omitempty"`
+	// Message is a human-readable message about the condition
+	// +optional
+	Message string `json:"message,omitempty"`
+	// LastTransitionTime is the last time the condition transitioned
+	// +optional
+	LastTransitionTime *metav1.Time `json:"lastTransitionTime,omitempty"`
+}
 
 // BatchSandboxSpec defines the desired state of BatchSandbox.
 type BatchSandboxSpec struct {
@@ -70,6 +131,14 @@ type BatchSandboxSpec struct {
 	// +kubebuilder:default=Retain
 	// +kubebuilder:validation:Optional
 	TaskResourcePolicyWhenCompleted *TaskResourcePolicy `json:"taskResourcePolicyWhenCompleted,omitempty"`
+
+	// Pause is the pause/resume intent written by Server and executed by Controller.
+	// nil = no operation / server retry bridge
+	// true = request Pause
+	// false = request Resume
+	// Controller never clears this field; Server may temporarily patch nil to force a new generation for retries.
+	// +optional
+	Pause *bool `json:"pause,omitempty"`
 }
 
 type TaskResourcePolicy string
@@ -100,6 +169,26 @@ type BatchSandboxStatus struct {
 	TaskPending int32 `json:"taskPending"`
 	// TaskUnknown is the number of Unknown task
 	TaskUnknown int32 `json:"taskUnknown"`
+	// TaskLastErrorMessage holds the most recent error message from a failed task.
+	// This includes lifecycle hook failures (e.g., ossfs mount timeout or error output).
+	// +optional
+	TaskLastErrorMessage string `json:"taskLastErrorMessage,omitempty"`
+
+	// Phase is the overall phase of the BatchSandbox, aggregated and written by Controller.
+	// Server reads this field directly without combining multiple fields.
+	// +optional
+	Phase BatchSandboxPhase `json:"phase,omitempty"`
+
+	// PauseObservedGeneration is the generation most recently ACKed by the Controller
+	// when entering pause/resume dispatch logic. Written immediately to prevent reentry (idempotent gating).
+	// +optional
+	PauseObservedGeneration int64 `json:"pauseObservedGeneration,omitempty"`
+
+	// Conditions records lifecycle and operational state details.
+	// +optional
+	// +listType=map
+	// +listMapKey=type
+	Conditions []BatchSandboxCondition `json:"conditions,omitempty"`
 }
 
 // +genclient
@@ -145,6 +234,17 @@ type TaskTemplateSpec struct {
 	Spec TaskSpec `json:"spec,omitempty"`
 }
 
+// ExecMode defines where a process should be executed.
+// +kubebuilder:validation:Enum=Local;Remote
+type ExecMode string
+
+const (
+	// ExecModeLocal executes in the task-executor container.
+	ExecModeLocal ExecMode = "Local"
+	// ExecModeRemote executes in the main container via nsenter.
+	ExecModeRemote ExecMode = "Remote"
+)
+
 type TaskSpec struct {
 	// +optional
 	Process *ProcessTask `json:"process,omitempty"`
@@ -169,6 +269,50 @@ type ProcessTask struct {
 	// WorkingDir task working directory.
 	// +optional
 	WorkingDir string `json:"workingDir,omitempty"`
+	// ExecMode controls where the process runs.
+	// Local: inside task-executor container.
+	// Remote: inside main container (via nsenter).
+	// If omitted, execution follows the task-executor sidecar mode configuration.
+	// +optional
+	ExecMode ExecMode `json:"execMode,omitempty"`
+	// Lifecycle defines actions to be executed before and after the main process.
+	// +optional
+	Lifecycle *ProcessLifecycle `json:"lifecycle,omitempty"`
+}
+
+// ProcessLifecycle defines lifecycle hooks for a process.
+type ProcessLifecycle struct {
+	// PreStart is executed before the main process starts.
+	// +optional
+	PreStart *LifecycleHandler `json:"preStart,omitempty"`
+	// PostStop is executed after the main process stops.
+	// +optional
+	PostStop *LifecycleHandler `json:"postStop,omitempty"`
+}
+
+// LifecycleHandler defines a lifecycle action.
+type LifecycleHandler struct {
+	// Exec specifies the action to take.
+	// +optional
+	Exec *ExecAction `json:"exec,omitempty"`
+	// ExecMode controls where the action runs.
+	// If omitted, lifecycle hooks run in the task-executor container.
+	// +optional
+	// +kubebuilder:default=Local
+	ExecMode ExecMode `json:"execMode,omitempty"`
+	// TimeoutSeconds is the maximum number of seconds the hook may run.
+	// If the hook does not complete within this time, it is killed and the
+	// enclosing operation (Start or Stop) is treated as failed.
+	// If not set or zero, there is no timeout.
+	// +optional
+	TimeoutSeconds *int64 `json:"timeoutSeconds,omitempty"`
+}
+
+// ExecAction describes a "run in container" action.
+type ExecAction struct {
+	// Command is the command line to execute inside the container.
+	// +kubebuilder:validation:Required
+	Command []string `json:"command"`
 }
 
 // TaskStatus task status

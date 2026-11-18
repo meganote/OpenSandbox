@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Alibaba Group Holding Ltd.
+ * Copyright 2025 The OpenSandbox Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,10 +21,18 @@ dependencies {
 
     implementation(libs.okhttp)
     implementation(libs.okhttp.logging)
-    implementation(libs.bundles.serialization)
+    implementation(libs.opentelemetry.api)
+    compileOnly(libs.bundles.serialization)
 
     testImplementation(libs.bundles.testing)
+    testImplementation(libs.bundles.serialization)
+    testImplementation(libs.opentelemetry.sdk.testing)
+    testImplementation(libs.logback.classic)
     testRuntimeOnly(libs.junit.platform.launcher)
+}
+
+tasks.named<com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar>("shadowJar") {
+    configurations = emptyList()
 }
 
 // Configure test tasks to use JDK 17
@@ -56,14 +64,5 @@ tasks.withType<JavaCompile> {
                 languageVersion.set(JavaLanguageVersion.of(17))
             },
         )
-    }
-}
-
-tasks.withType<org.jetbrains.dokka.gradle.DokkaTask>().configureEach {
-    dokkaSourceSets {
-        named("main") {
-            moduleName.set("Sandbox")
-            includes.from("Module.md")
-        }
     }
 }

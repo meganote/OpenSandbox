@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@ async def main() -> None:
     api_key = os.getenv("SANDBOX_API_KEY")
     image = os.getenv(
         "SANDBOX_IMAGE",
-        "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/code-interpreter:v1.0.2",
+        "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/code-interpreter:v1.1.0",
     )
 
     config = ConnectionConfig(
@@ -39,7 +39,7 @@ async def main() -> None:
         image,
         connection_config=config,
         extensions={"poolRef":"pool-sample"},
-        entrypoint=["/opt/opensandbox/code-interpreter.sh"],
+        entrypoint=["/opt/code-interpreter/code-interpreter.sh"],
         env={
             "TEST_ENV": "test",
         },

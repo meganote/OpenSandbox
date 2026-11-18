@@ -1,5 +1,5 @@
 #
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,6 +30,7 @@ from ...types import Response
 def _get_kwargs(
     sandbox_id: str,
 ) -> dict[str, Any]:
+
     _kwargs: dict[str, Any] = {
         "method": "get",
         "url": "/sandboxes/{sandbox_id}".format(
@@ -49,22 +50,34 @@ def _parse_response(
         return response_200
 
     if response.status_code == 401:
-        response_401 = ErrorResponse.from_dict(response.json())
+        try:
+            response_401 = ErrorResponse.from_dict(response.json())
+        except (ValueError, TypeError, KeyError):
+            return None
 
         return response_401
 
     if response.status_code == 403:
-        response_403 = ErrorResponse.from_dict(response.json())
+        try:
+            response_403 = ErrorResponse.from_dict(response.json())
+        except (ValueError, TypeError, KeyError):
+            return None
 
         return response_403
 
     if response.status_code == 404:
-        response_404 = ErrorResponse.from_dict(response.json())
+        try:
+            response_404 = ErrorResponse.from_dict(response.json())
+        except (ValueError, TypeError, KeyError):
+            return None
 
         return response_404
 
     if response.status_code == 500:
-        response_500 = ErrorResponse.from_dict(response.json())
+        try:
+            response_500 = ErrorResponse.from_dict(response.json())
+        except (ValueError, TypeError, KeyError):
+            return None
 
         return response_500
 
@@ -94,7 +107,7 @@ def sync_detailed(
 
      Returns the complete sandbox information including:
     - `id`, `status`, `metadata`, `expiresAt`, `createdAt`: Core information
-    - `image`: Container image specification (not included in create response)
+    - `image` or `snapshotId`: Startup source information (not included in create response)
     - `entrypoint`: Entry process specification
 
     This is the complete representation of the sandbox resource.
@@ -130,7 +143,7 @@ def sync(
 
      Returns the complete sandbox information including:
     - `id`, `status`, `metadata`, `expiresAt`, `createdAt`: Core information
-    - `image`: Container image specification (not included in create response)
+    - `image` or `snapshotId`: Startup source information (not included in create response)
     - `entrypoint`: Entry process specification
 
     This is the complete representation of the sandbox resource.
@@ -161,7 +174,7 @@ async def asyncio_detailed(
 
      Returns the complete sandbox information including:
     - `id`, `status`, `metadata`, `expiresAt`, `createdAt`: Core information
-    - `image`: Container image specification (not included in create response)
+    - `image` or `snapshotId`: Startup source information (not included in create response)
     - `entrypoint`: Entry process specification
 
     This is the complete representation of the sandbox resource.
@@ -195,7 +208,7 @@ async def asyncio(
 
      Returns the complete sandbox information including:
     - `id`, `status`, `metadata`, `expiresAt`, `createdAt`: Core information
-    - `image`: Container image specification (not included in create response)
+    - `image` or `snapshotId`: Startup source information (not included in create response)
     - `entrypoint`: Entry process specification
 
     This is the complete representation of the sandbox resource.

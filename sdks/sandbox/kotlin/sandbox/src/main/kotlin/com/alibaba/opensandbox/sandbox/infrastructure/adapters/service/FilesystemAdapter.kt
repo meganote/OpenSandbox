@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Alibaba Group Holding Ltd.
+ * Copyright 2025 The OpenSandbox Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,23 +19,24 @@ package com.alibaba.opensandbox.sandbox.infrastructure.adapters.service
 import com.alibaba.opensandbox.sandbox.HttpClientProvider
 import com.alibaba.opensandbox.sandbox.api.execd.FilesystemApi
 import com.alibaba.opensandbox.sandbox.domain.exceptions.InvalidArgumentException
-import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxApiException
-import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxError
-import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxError.Companion.UNEXPECTED_RESPONSE
 import com.alibaba.opensandbox.sandbox.domain.models.execd.filesystem.ContentReplaceEntry
+import com.alibaba.opensandbox.sandbox.domain.models.execd.filesystem.ContentReplaceResult
 import com.alibaba.opensandbox.sandbox.domain.models.execd.filesystem.EntryInfo
 import com.alibaba.opensandbox.sandbox.domain.models.execd.filesystem.MoveEntry
+import com.alibaba.opensandbox.sandbox.domain.models.execd.filesystem.ReadBytesResponse
 import com.alibaba.opensandbox.sandbox.domain.models.execd.filesystem.SearchEntry
 import com.alibaba.opensandbox.sandbox.domain.models.execd.filesystem.SetPermissionEntry
 import com.alibaba.opensandbox.sandbox.domain.models.execd.filesystem.WriteEntry
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxEndpoint
 import com.alibaba.opensandbox.sandbox.domain.services.Filesystem
+import com.alibaba.opensandbox.sandbox.domain.services.IdentityFilesystem
 import com.alibaba.opensandbox.sandbox.infrastructure.adapters.converter.FilesystemConverter.toApiPermissionMap
 import com.alibaba.opensandbox.sandbox.infrastructure.adapters.converter.FilesystemConverter.toApiRenameFileItems
 import com.alibaba.opensandbox.sandbox.infrastructure.adapters.converter.FilesystemConverter.toApiReplaceFileContentMap
 import com.alibaba.opensandbox.sandbox.infrastructure.adapters.converter.FilesystemConverter.toEntryInfo
 import com.alibaba.opensandbox.sandbox.infrastructure.adapters.converter.FilesystemConverter.toEntryInfoMap
-import com.alibaba.opensandbox.sandbox.infrastructure.adapters.converter.parseSandboxError
+import com.alibaba.opensandbox.sandbox.infrastructure.adapters.converter.isFileNotFound
+import com.alibaba.opensandbox.sandbox.infrastructure.adapters.converter.toSandboxApiException
 import com.alibaba.opensandbox.sandbox.infrastructure.adapters.converter.toSandboxException
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -63,13 +64,18 @@ import java.nio.charset.Charset
 internal class FilesystemAdapter(
     private val httpClientProvider: HttpClientProvider,
     private val execdEndpoint: SandboxEndpoint,
-) : Filesystem {
+) : IdentityFilesystem {
     companion object {
         private const val FILESYSTEM_UPLOAD_PATH = "/files/upload"
         private const val FILESYSTEM_DOWNLOAD_PATH = "/files/download"
     }
 
     private val logger = LoggerFactory.getLogger(FilesystemAdapter::class.java)
+    private val unscopedEndpoint =
+        execdEndpoint.endpoint
+            .substringBefore("/v1/filesystem/")
+            .trimEnd('/')
+            .removeSuffix("/v1/filesystem")
     private val api =
         FilesystemApi(
             "${httpClientProvider.config.protocol}://${execdEndpoint.endpoint}",
@@ -84,31 +90,47 @@ internal class FilesystemAdapter(
                 .build(),
         )
 
+    override fun withIdentity(
+        uid: Long,
+        gid: Long,
+    ): Filesystem {
+        require(uid in 0..IdentityFilesystem.MAX_IDENTITY_ID) {
+            "uid must be between 0 and ${IdentityFilesystem.MAX_IDENTITY_ID}"
+        }
+        require(gid in 0..IdentityFilesystem.MAX_IDENTITY_ID) {
+            "gid must be between 0 and ${IdentityFilesystem.MAX_IDENTITY_ID}"
+        }
+        return FilesystemAdapter(
+            httpClientProvider,
+            SandboxEndpoint(
+                endpoint = unscopedEndpoint.trimEnd('/') + "/v1/filesystem/$uid/$gid",
+                headers = execdEndpoint.headers,
+                origin = execdEndpoint.origin,
+            ),
+        )
+    }
+
     override fun readFile(
         path: String,
         encoding: String,
         range: String?,
+        offset: Int?,
+        limit: Int?,
     ): String {
         try {
-            val request = buildDownloadRequest(path, range)
-            httpClientProvider.httpClient.newCall(request).execute().use { response ->
+            val request = buildDownloadRequest(path, range, offset, limit)
+            httpClientProvider.transferClient.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
-                    val errorBodyString = response.body?.string()
-                    val sandboxError = parseSandboxError(errorBodyString)
-                    val message = "Failed to read file. Status code: ${response.code}, Body: $errorBodyString"
-                    throw SandboxApiException(
-                        message = message,
-                        statusCode = response.code,
-                        error = sandboxError ?: SandboxError(UNEXPECTED_RESPONSE),
-                        requestId = response.header("X-Request-ID"),
-                    )
+                    throw response.toSandboxApiException { statusCode, body ->
+                        "Failed to read file. Status code: $statusCode, Body: $body"
+                    }
                 }
 
                 val charset = getCharsetFromEncoding(encoding)
                 return response.body?.source()?.readString(charset) ?: ""
             }
         } catch (e: Exception) {
-            logger.error("Failed to read file with encoding $encoding: $path", e)
+            logReadFailure("Failed to read file with encoding $encoding: $path", e)
             throw e.toSandboxException()
         }
     }
@@ -116,25 +138,29 @@ internal class FilesystemAdapter(
     override fun readByteArray(
         path: String,
         range: String?,
-    ): ByteArray {
+        offset: Int?,
+        limit: Int?,
+    ): ByteArray = readByteArrayDetailed(path, range, offset, limit).body
+
+    override fun readByteArrayDetailed(
+        path: String,
+        range: String?,
+        offset: Int?,
+        limit: Int?,
+    ): ReadBytesResponse<ByteArray> {
         try {
-            val request = buildDownloadRequest(path, range)
-            httpClientProvider.httpClient.newCall(request).execute().use { response ->
+            val request = buildDownloadRequest(path, range, offset, limit)
+            httpClientProvider.transferClient.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
-                    val errorBodyString = response.body?.string()
-                    val sandboxError = parseSandboxError(errorBodyString)
-                    val message = "Failed to read file. Status code: ${response.code}, Body: $errorBodyString"
-                    throw SandboxApiException(
-                        message = message,
-                        statusCode = response.code,
-                        error = sandboxError ?: SandboxError(UNEXPECTED_RESPONSE),
-                        requestId = response.header("X-Request-ID"),
-                    )
+                    throw response.toSandboxApiException { statusCode, body ->
+                        "Failed to read file. Status code: $statusCode, Body: $body"
+                    }
                 }
-                return response.body?.bytes() ?: ByteArray(0)
+                val body = response.body?.bytes() ?: ByteArray(0)
+                return response.toReadBytesResponse(body, offset != null || limit != null)
             }
         } catch (e: Exception) {
-            logger.error("Failed to read file as byte array: $path", e)
+            logReadFailure("Failed to read file as byte array: $path", e)
             throw e.toSandboxException()
         }
     }
@@ -142,32 +168,39 @@ internal class FilesystemAdapter(
     override fun readStream(
         path: String,
         range: String?,
-    ): InputStream {
+        offset: Int?,
+        limit: Int?,
+    ): InputStream = readStreamDetailed(path, range, offset, limit).body
+
+    override fun readStreamDetailed(
+        path: String,
+        range: String?,
+        offset: Int?,
+        limit: Int?,
+    ): ReadBytesResponse<InputStream> {
         try {
-            val request = buildDownloadRequest(path, range)
-            val response = httpClientProvider.httpClient.newCall(request).execute()
+            val request = buildDownloadRequest(path, range, offset, limit)
+            val response = httpClientProvider.transferClient.newCall(request).execute()
 
             if (!response.isSuccessful) {
                 try {
-                    val errorBodyString = response.body?.string()
-                    val sandboxError = parseSandboxError(errorBodyString)
-                    val message = "Failed to read file. Status code: ${response.code}, Body: $errorBodyString"
-                    throw SandboxApiException(
-                        message = message,
-                        statusCode = response.code,
-                        error = sandboxError ?: SandboxError(UNEXPECTED_RESPONSE),
-                        requestId = response.header("X-Request-ID"),
-                    )
+                    throw response.toSandboxApiException { statusCode, body ->
+                        "Failed to read file. Status code: $statusCode, Body: $body"
+                    }
                 } catch (e: Exception) {
                     response.close()
                     throw e
                 }
             }
 
-            return response.body?.byteStream()
-                ?: throw IllegalStateException("Response body is null")
+            val responseBody =
+                response.body ?: run {
+                    response.close()
+                    throw IllegalStateException("Response body is null")
+                }
+            return response.toReadBytesResponse(responseBody.byteStream(), offset != null || limit != null)
         } catch (e: Exception) {
-            logger.error("Failed to read file as stream: $path", e)
+            logReadFailure("Failed to read file as stream: $path", e)
             throw e.toSandboxException()
         }
     }
@@ -230,17 +263,11 @@ internal class FilesystemAdapter(
                     .post(builder.build())
                     .build()
 
-            httpClientProvider.httpClient.newCall(request).execute().use { response ->
+            httpClientProvider.transferClient.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
-                    val errorBodyString = response.body?.string()
-                    val sandboxError = parseSandboxError(errorBodyString)
-                    val message = "Failed to write files. Status code: ${response.code}, Body: $errorBodyString"
-                    throw SandboxApiException(
-                        message = message,
-                        statusCode = response.code,
-                        error = sandboxError ?: SandboxError(UNEXPECTED_RESPONSE),
-                        requestId = response.header("X-Request-ID"),
-                    )
+                    throw response.toSandboxApiException { statusCode, body ->
+                        "Failed to write files. Status code: $statusCode, Body: $body"
+                    }
                 }
             }
         } catch (e: Exception) {
@@ -285,6 +312,18 @@ internal class FilesystemAdapter(
         }
     }
 
+    override fun listDirectory(
+        path: String,
+        depth: Int?,
+    ): List<EntryInfo> {
+        return try {
+            api.listDirectory(path, depth).map { it.toEntryInfo() }
+        } catch (e: Exception) {
+            logger.error("Failed to list directory {}", path, e)
+            throw e.toSandboxException()
+        }
+    }
+
     override fun moveFiles(entries: List<MoveEntry>) {
         return try {
             val renameItems = entries.toApiRenameFileItems()
@@ -306,9 +345,31 @@ internal class FilesystemAdapter(
     }
 
     override fun replaceContents(entries: List<ContentReplaceEntry>) {
+        try {
+            val replaceMap = entries.toApiReplaceFileContentMap()
+            try {
+                api.replaceContent(replaceMap)
+            } catch (_: NullPointerException) {
+                // Older execd versions return an empty body for verbose=false,
+                // which the generated client cannot deserialize. The replacement
+                // itself succeeded if no HTTP error was thrown.
+            }
+        } catch (e: Exception) {
+            logger.error("Failed to replace contents", e)
+            throw e.toSandboxException()
+        }
+    }
+
+    override fun replaceContentsDetailed(entries: List<ContentReplaceEntry>): List<ContentReplaceResult> {
         return try {
             val replaceMap = entries.toApiReplaceFileContentMap()
-            api.replaceContent(replaceMap)
+            val response = api.replaceContent(replaceMap, verbose = true)
+            response.map { (path, result) ->
+                ContentReplaceResult(
+                    path = path,
+                    replacedCount = result.replacedCount,
+                )
+            }
         } catch (e: Exception) {
             logger.error("Failed to replace contents", e)
             throw e.toSandboxException()
@@ -335,6 +396,26 @@ internal class FilesystemAdapter(
         }
     }
 
+    /**
+     * Logs a failed read operation, distinguishing genuine failures from the expected
+     * "file does not exist" case.
+     *
+     * A missing file is a normal control-flow outcome (e.g. polling for a not-yet-created
+     * file), so it is logged at DEBUG level instead of ERROR to avoid flooding callers'
+     * error logs and monitoring with stack traces for a non-error condition. The exception
+     * is still propagated to the caller unchanged.
+     */
+    private fun logReadFailure(
+        message: String,
+        e: Exception,
+    ) {
+        if (e.isFileNotFound()) {
+            logger.debug(message, e)
+        } else {
+            logger.error(message, e)
+        }
+    }
+
     private fun getCharsetFromEncoding(encoding: String): Charset {
         try {
             return charset(encoding)
@@ -347,17 +428,25 @@ internal class FilesystemAdapter(
     private fun buildDownloadRequest(
         path: String,
         range: String?,
+        offset: Int? = null,
+        limit: Int? = null,
     ): Request {
         val baseUrlString = "${httpClientProvider.config.protocol}://${execdEndpoint.endpoint}$FILESYSTEM_DOWNLOAD_PATH"
-        val httpUrl =
+        val urlBuilder =
             baseUrlString.toHttpUrl()
                 .newBuilder()
                 .addQueryParameter("path", path)
-                .build()
+
+        if (offset != null) {
+            urlBuilder.addQueryParameter("offset", offset.toString())
+        }
+        if (limit != null) {
+            urlBuilder.addQueryParameter("limit", limit.toString())
+        }
 
         val requestBuilder =
             Request.Builder()
-                .url(httpUrl)
+                .url(urlBuilder.build())
                 .headers(execdEndpoint.headers.toHeaders())
                 .get()
 

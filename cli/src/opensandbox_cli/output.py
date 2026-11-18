@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import json
 import sys
-from typing import Any, Sequence
+from collections.abc import Generator, Sequence
+from contextlib import contextmanager
+from typing import Any
 
 import click
 
@@ -28,8 +30,64 @@ except ImportError:  # pragma: no cover
     yaml = None  # type: ignore[assignment]
 
 from pydantic import BaseModel
+from rich import box
 from rich.console import Console
+from rich.markup import escape
+from rich.panel import Panel
+from rich.status import Status
 from rich.table import Table
+from rich.text import Text
+
+_STATUS_STYLES: dict[str, tuple[str, str]] = {
+    "running": ("bold green", "●"),
+    "ready": ("bold green", "●"),
+    "healthy": ("bold green", "●"),
+    "pending": ("bold yellow", "◐"),
+    "creating": ("bold yellow", "◐"),
+    "starting": ("bold yellow", "◐"),
+    "paused": ("bold blue", "⏸"),
+    "stopped": ("dim", "○"),
+    "terminated": ("dim", "○"),
+    "killed": ("dim", "○"),
+    "error": ("bold red", "✗"),
+    "failed": ("bold red", "✗"),
+    "unhealthy": ("bold red", "✗"),
+    "created": ("bold cyan", "✦"),
+}
+
+_STATUS_COLUMNS = {"status", "state", "healthy"}
+_DIM_COLUMNS = {"created_at", "expires_at", "modified_at", "updated_at"}
+_ID_COLUMNS = {"id", "sandbox_id", "execution_id", "context_id"}
+
+
+def _stdout_can_encode(text: str) -> bool:
+    """Return whether stdout can represent ``text`` without substitution."""
+    encoding = getattr(sys.stdout, "encoding", None)
+    if encoding is None:
+        return True
+    try:
+        text.encode(encoding)
+    except (LookupError, UnicodeEncodeError):
+        return False
+    return True
+
+
+def _style_value(col: str, value: str) -> Text:
+    """Apply contextual styling to a cell value."""
+    lower = value.lower()
+
+    if col in _STATUS_COLUMNS:
+        style, icon = _STATUS_STYLES.get(lower, ("", ""))
+        if style:
+            return Text(f"{icon} {value}", style=style)
+
+    if col in _DIM_COLUMNS:
+        return Text(value, style="dim")
+
+    if col in _ID_COLUMNS:
+        return Text(value, style="bold cyan")
+
+    return Text(value)
 
 
 class OutputFormatter:
@@ -37,17 +95,109 @@ class OutputFormatter:
 
     def __init__(self, fmt: str = "table", *, color: bool = True) -> None:
         self.fmt = fmt
-        self.console = Console(
-            stderr=False, no_color=not color, force_terminal=None
-        )
+        self.color = color
+        self.console = Console(stderr=False, no_color=not color)
+        self._err_console = Console(stderr=True, no_color=not color)
 
-    # ------------------------------------------------------------------
-    # Public helpers
-    # ------------------------------------------------------------------
+    def _message(
+        self,
+        status: str,
+        msg: str,
+        *,
+        icon: str,
+        style: str,
+        plain: str,
+        stderr: bool,
+    ) -> None:
+        if self.fmt == "json":
+            self._print_json({"status": status, "message": msg})
+            return
+        if self.fmt == "yaml":
+            self._print_yaml({"status": status, "message": msg})
+            return
+        if self.color:
+            console = self._err_console if stderr else self.console
+            console.print(f"  [bold {style}]{icon} {escape(msg)}[/]")
+        else:
+            click.echo(f"{plain}: {msg}", err=stderr)
+
+    def success(self, msg: str) -> None:
+        """Print a success message with ✅ icon."""
+        self._message("ok", msg, icon="✅", style="green", plain="OK", stderr=False)
+
+    def info(self, msg: str) -> None:
+        """Print an info message with ℹ️ icon."""
+        self._message("info", msg, icon="ℹ️ ", style="blue", plain="INFO", stderr=False)
+
+    def warning(self, msg: str) -> None:
+        """Print a warning message with ⚠️ icon."""
+        self._message("warning", msg, icon="⚠️ ", style="yellow", plain="WARN", stderr=True)
+
+    def error(self, msg: str) -> None:
+        """Print an error message with ❌ icon."""
+        self._message("error", msg, icon="❌", style="red", plain="ERROR", stderr=True)
+
+    def error_panel(self, msg: str, title: str = "Error") -> None:
+        """Print an error with a bold header and message."""
+        if self.color:
+            self._err_console.print()
+            self._err_console.print(f"  [bold red]{title}[/]")
+            self._err_console.print(f"  [dim]{'─' * (len(title) + 2)}[/]")
+            for line in msg.splitlines():
+                self._err_console.print(f"  {escape(line)}")
+            self._err_console.print()
+        else:
+            click.echo(f"ERROR [{title}]: {msg}", err=True)
+
+    @contextmanager
+    def spinner(self, msg: str) -> Generator[Status, None, None]:
+        """Context manager that shows a spinner while work is in progress."""
+        if self.color and self.fmt == "table":
+            with self._err_console.status(f"[bold cyan]⏳ {escape(msg)}[/]", spinner="dots") as status:
+                yield status
+        else:
+            yield None  # type: ignore[arg-type]
+
+    def panel(self, content: str, *, title: str | None = None, style: str = "cyan") -> None:
+        """Print content inside a styled panel."""
+        if self.color:
+            self.console.print(Panel(
+                Text(content),
+                title=title,
+                title_align="left",
+                border_style=style,
+                box=box.ROUNDED,
+                padding=(0, 1),
+            ))
+        else:
+            if title:
+                click.echo(f"--- {title} ---")
+            click.echo(content)
+
+    def success_panel(self, data: dict[str, Any], *, title: str = "Success") -> None:
+        """Print a success result with a header and indented key-value pairs."""
+        if self.fmt != "table":
+            if self.fmt == "json":
+                self._print_json(data)
+            elif self.fmt == "yaml":
+                self._print_yaml(data)
+            return
+
+        if self.color:
+            self.console.print()
+            self.console.print(f"  [bold green]✓ {title}[/]")
+            self.console.print(f"  [dim]{'─' * (len(title) + 2)}[/]")
+            for k, v in data.items():
+                self.console.print(f"  [bold]{escape(str(k))}:[/] [cyan]{escape(str(v))}[/]")
+            self.console.print()
+        else:
+            click.echo(f"--- {title} ---")
+            for k, v in data.items():
+                click.echo(f"  {k}: {v}")
 
     def print_model(self, model: BaseModel, title: str | None = None) -> None:
         """Print a single Pydantic model as key-value panel or JSON/YAML."""
-        data = _model_to_dict(model)
+        data = model.model_dump(mode="json")
         if self.fmt == "json":
             self._print_json(data)
         elif self.fmt == "yaml":
@@ -63,7 +213,22 @@ class OutputFormatter:
         title: str | None = None,
     ) -> None:
         """Print a list of Pydantic models as a table or JSON/YAML."""
-        rows = [_model_to_dict(m) for m in models]
+        rows = [m.model_dump(mode="json") for m in models]
+        if self.fmt == "json":
+            self._print_json(rows)
+        elif self.fmt == "yaml":
+            self._print_yaml(rows)
+        else:
+            self._print_table(rows, columns, title=title)
+
+    def print_rows(
+        self,
+        rows: list[dict[str, Any]],
+        columns: list[str],
+        *,
+        title: str | None = None,
+    ) -> None:
+        """Print pre-processed rows (list of dicts) as a table or JSON/YAML."""
         if self.fmt == "json":
             self._print_json(rows)
         elif self.fmt == "yaml":
@@ -80,16 +245,11 @@ class OutputFormatter:
         else:
             self._print_kv_table(data, title=title)
 
-    def print_text(self, text: str) -> None:
-        """Print raw text (ignores format)."""
-        click.echo(text)
-
-    # ------------------------------------------------------------------
-    # Internal renderers
-    # ------------------------------------------------------------------
-
     def _print_json(self, data: Any) -> None:
-        click.echo(json.dumps(data, indent=2, default=str))
+        if self.color:
+            self.console.print_json(json.dumps(data, default=str))
+        else:
+            click.echo(json.dumps(data, indent=2, default=str))
 
     def _print_yaml(self, data: Any) -> None:
         if yaml is None:
@@ -97,14 +257,31 @@ class OutputFormatter:
                 "PyYAML is not installed. Use --output json instead.", fg="red", err=True
             )
             sys.exit(1)
-        click.echo(yaml.dump(data, default_flow_style=False, allow_unicode=True).rstrip())
+        text = yaml.dump(data, default_flow_style=False, allow_unicode=True).rstrip()
+        if not _stdout_can_encode(text):
+            # Escape non-ASCII to keep machine-readable output valid on
+            # limited code pages.
+            text = yaml.dump(
+                data, default_flow_style=False, allow_unicode=False
+            ).rstrip()
+        click.echo(text)
 
     def _print_kv_table(self, data: dict[str, Any], *, title: str | None = None) -> None:
-        table = Table(title=title, show_header=True, header_style="bold")
-        table.add_column("Key", style="cyan")
+        table = Table(
+            title=title,
+            show_header=True,
+            header_style="bold magenta",
+            title_style="bold cyan",
+            box=box.ROUNDED,
+            border_style="bright_black",
+            padding=(0, 1),
+            show_lines=True,
+        )
+        table.add_column("Key", style="bold cyan", no_wrap=True)
         table.add_column("Value")
         for k, v in data.items():
-            table.add_row(str(k), str(v) if v is not None else "-")
+            val_text = _style_value(k, str(v)) if v is not None else Text("-", style="dim")
+            table.add_row(str(k), val_text)
         self.console.print(table)
 
     def _print_table(
@@ -114,18 +291,32 @@ class OutputFormatter:
         *,
         title: str | None = None,
     ) -> None:
-        table = Table(title=title, show_header=True, header_style="bold")
+        table = Table(
+            title=title,
+            show_header=True,
+            header_style="bold magenta",
+            title_style="bold cyan",
+            box=box.ROUNDED,
+            border_style="bright_black",
+            padding=(0, 1),
+            row_styles=["", "dim"],
+        )
         for col in columns:
-            table.add_column(col.upper())
+            style = ""
+            if col in _ID_COLUMNS:
+                style = "bold cyan"
+            elif col in _DIM_COLUMNS:
+                style = "dim"
+            table.add_column(col.upper(), style=style, no_wrap=(col in _ID_COLUMNS))
+
         for row in rows:
-            table.add_row(*(str(row.get(col, "-")) for col in columns))
+            cells: list[Text | str] = []
+            for col in columns:
+                raw = row.get(col)
+                val = "-" if raw is None else str(raw)
+                if col in _STATUS_COLUMNS:
+                    cells.append(_style_value(col, val))
+                else:
+                    cells.append(Text(val))
+            table.add_row(*cells)
         self.console.print(table)
-
-
-# ------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------
-
-
-def _model_to_dict(model: BaseModel) -> dict[str, Any]:
-    return model.model_dump(mode="json")

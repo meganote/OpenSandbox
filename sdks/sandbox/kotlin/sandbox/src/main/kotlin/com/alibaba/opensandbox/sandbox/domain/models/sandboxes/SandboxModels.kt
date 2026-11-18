@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Alibaba Group Holding Ltd.
+ * Copyright 2025 The OpenSandbox Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -218,14 +218,61 @@ class SandboxImageAuth private constructor(
 }
 
 /**
+ * Runtime platform constraint for sandbox provisioning.
+ *
+ * @property os Target operating system (linux or windows)
+ * @property arch Target CPU architecture (amd64 or arm64)
+ */
+class PlatformSpec private constructor(
+    val os: String,
+    val arch: String,
+) {
+    companion object {
+        @JvmStatic
+        fun builder(): Builder = Builder()
+    }
+
+    class Builder {
+        private var os: String? = null
+        private var arch: String? = null
+
+        fun os(os: String): Builder {
+            require(os == "linux" || os == "windows") { "Platform os must be one of: linux, windows" }
+            this.os = os
+            return this
+        }
+
+        fun arch(arch: String): Builder {
+            require(arch == "amd64" || arch == "arm64") {
+                "Platform arch must be one of: amd64, arm64"
+            }
+            this.arch = arch
+            return this
+        }
+
+        fun build(): PlatformSpec {
+            val osValue = os ?: throw IllegalArgumentException("Platform os must be specified")
+            val archValue = arch ?: throw IllegalArgumentException("Platform arch must be specified")
+            return PlatformSpec(os = osValue, arch = archValue)
+        }
+    }
+}
+
+/**
  * Egress rule for matching network targets.
  *
  * @property action Whether to allow or deny matching targets.
- * @property target FQDN or wildcard domain (e.g., "example.com", "*.example.com")
+ * @property target FQDN, wildcard domain (e.g., "example.com", "*.example.com"), IP address, or
+ * CIDR. May be null when [ports] is set; otherwise required.
+ * @property ports Restricts this rule to specific TCP destination ports (1-65535, max 256, no
+ * duplicates). A null [target] with [ports] set applies to all IPv4/IPv6 destinations. A domain
+ * [target] combined with [ports] is rejected by the server/sidecar: domain rules are evaluated at
+ * the DNS layer, which has no port dimension.
  */
 class NetworkRule private constructor(
     val action: Action,
-    val target: String,
+    val target: String?,
+    val ports: List<Int>?,
 ) {
     enum class Action {
         ALLOW,
@@ -233,13 +280,30 @@ class NetworkRule private constructor(
     }
 
     companion object {
+        private const val MAX_PORTS_PER_RULE = 256
+
         @JvmStatic
         fun builder(): Builder = Builder()
+
+        /**
+         * Lenient wire-shape factory for READ-BACK paths only (policy
+         * GET/EffectiveOf results): it skips the write-path validation so
+         * contract drift on the server can never turn a policy read into an
+         * uncaught [IllegalArgumentException]. Callers normalize wire
+         * artifacts first (blank target, empty ports list) — see the
+         * model converters.
+         */
+        internal fun fromWire(
+            action: Action,
+            target: String?,
+            ports: List<Int>?,
+        ): NetworkRule = NetworkRule(action = action, target = target, ports = ports)
     }
 
     class Builder {
         private var action: Action? = null
         private var target: String? = null
+        private var ports: List<Int>? = null
 
         fun action(action: Action): Builder {
             this.action = action
@@ -252,13 +316,82 @@ class NetworkRule private constructor(
             return this
         }
 
+        fun ports(ports: List<Int>): Builder {
+            require(ports.isNotEmpty()) { "Ports cannot be empty" }
+            require(ports.size <= MAX_PORTS_PER_RULE) { "Ports cannot exceed $MAX_PORTS_PER_RULE entries" }
+            require(ports.toSet().size == ports.size) { "Ports cannot contain duplicates" }
+            for (port in ports) {
+                require(port in 1..65535) { "Port $port out of range 1-65535" }
+            }
+            // Snapshot at set time: later caller mutation must not bypass
+            // the checks above.
+            this.ports = ports.toList()
+            return this
+        }
+
         fun build(): NetworkRule {
             val actionValue = action ?: throw IllegalArgumentException("Action must be specified")
-            val targetValue = target ?: throw IllegalArgumentException("Target must be specified")
+            val targetValue = target
+            val portsValue = ports
+            require(targetValue != null || portsValue != null) { "Either target or ports must be specified" }
+            if (portsValue != null && targetValue != null && !isIpOrCidr(targetValue)) {
+                throw IllegalArgumentException(
+                    "Ports are not supported for domain targets: \"$targetValue\" " +
+                        "(domain rules are evaluated at the DNS layer, which has no port dimension)",
+                )
+            }
             return NetworkRule(
                 action = actionValue,
                 target = targetValue,
+                ports = portsValue?.toList(),
             )
+        }
+
+        /**
+         * Mirrors the sidecar's netip-based IP-vs-domain classification,
+         * on the trimmed target.
+         */
+        private fun isIpOrCidr(target: String): Boolean {
+            val t = target.trim()
+            if (t.count { it == '/' } > 1) return false
+            val addr = t.substringBefore('/')
+            val prefix = t.substringAfter('/', missingDelimiterValue = "")
+            if (prefix.isNotEmpty()) {
+                if (t.contains('%')) return false // scoped prefixes: netip rejects
+                if (prefix.any { it !in '0'..'9' }) return false
+                val limit = if (addr.contains(':')) 128 else 32
+                if (prefix.toInt() > limit) return false
+            }
+            return if (addr.contains(':')) isIpv6Literal(addr) else isIpv4Literal(addr)
+        }
+
+        private fun isIpv4Literal(addr: String): Boolean {
+            val octets = addr.split('.')
+            return octets.size == 4 &&
+                octets.all { octet ->
+                    // Leading zeros are rejected (server-side too).
+                    octet.length in 1..3 && octet.all { it in '0'..'9' } &&
+                        (octet.length == 1 || octet[0] != '0') && octet.toInt() <= 255
+                }
+        }
+
+        private fun isIpv6Literal(addr: String): Boolean {
+            val host = addr.substringBefore('%')
+            if (host.isEmpty() || host.contains(":::")) return false
+            val halves = host.split("::")
+            if (halves.size > 2) return false
+            var groups = halves.flatMap { half -> half.split(':').filter(String::isNotEmpty) }
+            if (groups.lastOrNull()?.contains('.') == true) {
+                // Embedded IPv4 tail counts as two groups.
+                if (!isIpv4Literal(groups.last())) return false
+                groups = groups.dropLast(1) + listOf("0", "0")
+            }
+            if (groups.any { group -> group.length > 4 || group.any { ch -> ch !in '0'..'9' && ch !in 'a'..'f' && ch !in 'A'..'F' } }) {
+                return false
+            }
+            // "::" compresses one or more all-zero groups; without it the
+            // address must carry exactly eight groups.
+            return if (halves.size == 2) groups.size <= 7 else groups.size == 8
         }
     }
 }
@@ -306,7 +439,7 @@ class NetworkPolicy private constructor(
         fun build(): NetworkPolicy {
             return NetworkPolicy(
                 defaultAction = defaultAction,
-                egress = if (egress.isEmpty()) null else egress.toList(),
+                egress = egress.toList(),
             )
         }
     }
@@ -328,6 +461,8 @@ class Host private constructor(
     val path: String,
 ) {
     companion object {
+        private val HOST_PATH_PATTERN = Regex("""^(/|[A-Za-z]:[\\/])""")
+
         @JvmStatic
         fun builder(): Builder = Builder()
 
@@ -339,7 +474,9 @@ class Host private constructor(
         private var path: String? = null
 
         fun path(path: String): Builder {
-            require(path.startsWith("/")) { "Host path must be an absolute path starting with '/'" }
+            require(HOST_PATH_PATTERN.containsMatchIn(path)) {
+                "Host path must be an absolute path starting with '/' or a Windows drive letter (e.g. 'C:\\' or 'D:/')"
+            }
             this.path = path
             return this
         }
@@ -352,15 +489,27 @@ class Host private constructor(
 }
 
 /**
- * Kubernetes PersistentVolumeClaim mount backend.
+ * Platform-managed named volume backend.
  *
- * References an existing PVC in the same namespace as the sandbox pod.
- * Only available in Kubernetes runtime.
+ * Runtime-neutral abstraction for referencing a pre-existing named volume:
+ * - Kubernetes: maps to a PersistentVolumeClaim in the same namespace.
+ * - Docker: maps to a Docker named volume.
  *
- * @property claimName Name of the PersistentVolumeClaim in the same namespace
+ * @property claimName Name of the platform volume. In Kubernetes this is the PVC name;
+ * in Docker this is the named volume name.
+ * @property createIfNotExists When true (default), auto-create volume if absent.
+ * @property deleteOnSandboxTermination When true, delete the auto-created volume (Docker named volume or Kubernetes PVC) on sandbox deletion. Pre-existing volumes are never removed.
+ * @property storageClass Kubernetes StorageClass for auto-created PVCs. Null means default class.
+ * @property storage PVC storage request for auto-created PVCs (e.g. "1Gi").
+ * @property accessModes Access modes for auto-created PVCs (e.g. ["ReadWriteOnce"]).
  */
 class PVC private constructor(
     val claimName: String,
+    val createIfNotExists: Boolean,
+    val deleteOnSandboxTermination: Boolean,
+    val storageClass: String?,
+    val storage: String?,
+    val accessModes: List<String>?,
 ) {
     companion object {
         @JvmStatic
@@ -372,6 +521,11 @@ class PVC private constructor(
 
     class Builder {
         private var claimName: String? = null
+        private var createIfNotExists: Boolean = true
+        private var deleteOnSandboxTermination: Boolean = false
+        private var storageClass: String? = null
+        private var storage: String? = null
+        private var accessModes: List<String>? = null
 
         fun claimName(claimName: String): Builder {
             require(claimName.isNotBlank()) { "Claim name cannot be blank" }
@@ -379,9 +533,140 @@ class PVC private constructor(
             return this
         }
 
+        fun createIfNotExists(createIfNotExists: Boolean): Builder {
+            this.createIfNotExists = createIfNotExists
+            return this
+        }
+
+        fun deleteOnSandboxTermination(deleteOnSandboxTermination: Boolean): Builder {
+            this.deleteOnSandboxTermination = deleteOnSandboxTermination
+            return this
+        }
+
+        fun storageClass(storageClass: String?): Builder {
+            this.storageClass = storageClass
+            return this
+        }
+
+        fun storage(storage: String?): Builder {
+            this.storage = storage
+            return this
+        }
+
+        fun accessModes(accessModes: List<String>?): Builder {
+            this.accessModes = accessModes
+            return this
+        }
+
+        fun accessModes(vararg accessModes: String): Builder {
+            this.accessModes = accessModes.toList()
+            return this
+        }
+
         fun build(): PVC {
             val claimNameValue = claimName ?: throw IllegalArgumentException("Claim name must be specified")
-            return PVC(claimName = claimNameValue)
+            return PVC(
+                claimName = claimNameValue,
+                createIfNotExists = createIfNotExists,
+                deleteOnSandboxTermination = deleteOnSandboxTermination,
+                storageClass = storageClass,
+                storage = storage,
+                accessModes = accessModes,
+            )
+        }
+    }
+}
+
+/**
+ * Alibaba Cloud OSS mount backend via ossfs.
+ *
+ * @property bucket OSS bucket name
+ * @property endpoint OSS endpoint (for example, `oss-cn-hangzhou.aliyuncs.com`)
+ * @property accessKeyId OSS access key ID for inline credentials mode
+ * @property accessKeySecret OSS access key secret for inline credentials mode
+ * @property version ossfs major version used by runtime mount integration
+ * @property options Additional ossfs mount options
+ */
+class OSSFS private constructor(
+    val bucket: String,
+    val endpoint: String,
+    val accessKeyId: String,
+    val accessKeySecret: String,
+    val version: String,
+    val options: List<String>?,
+) {
+    companion object {
+        const val VERSION_1_0 = "1.0"
+        const val VERSION_2_0 = "2.0"
+
+        @JvmStatic
+        fun builder(): Builder = Builder()
+    }
+
+    class Builder {
+        private var bucket: String? = null
+        private var endpoint: String? = null
+        private var accessKeyId: String? = null
+        private var accessKeySecret: String? = null
+        private var version: String = VERSION_2_0
+        private var options: List<String>? = null
+
+        fun bucket(bucket: String): Builder {
+            require(bucket.isNotBlank()) { "Bucket cannot be blank" }
+            this.bucket = bucket
+            return this
+        }
+
+        fun endpoint(endpoint: String): Builder {
+            require(endpoint.isNotBlank()) { "Endpoint cannot be blank" }
+            this.endpoint = endpoint
+            return this
+        }
+
+        fun accessKeyId(accessKeyId: String): Builder {
+            require(accessKeyId.isNotBlank()) { "Access key ID cannot be blank" }
+            this.accessKeyId = accessKeyId
+            return this
+        }
+
+        fun accessKeySecret(accessKeySecret: String): Builder {
+            require(accessKeySecret.isNotBlank()) { "Access key secret cannot be blank" }
+            this.accessKeySecret = accessKeySecret
+            return this
+        }
+
+        fun version(version: String): Builder {
+            require(version == VERSION_1_0 || version == VERSION_2_0) {
+                "OSSFS version must be one of: 1.0, 2.0"
+            }
+            this.version = version
+            return this
+        }
+
+        fun options(options: List<String>?): Builder {
+            this.options = options
+            return this
+        }
+
+        fun options(vararg options: String): Builder {
+            this.options = options.toList()
+            return this
+        }
+
+        fun build(): OSSFS {
+            val bucketValue = bucket ?: throw IllegalArgumentException("Bucket must be specified")
+            val endpointValue = endpoint ?: throw IllegalArgumentException("Endpoint must be specified")
+            val accessKeyIdValue = accessKeyId ?: throw IllegalArgumentException("Access key ID must be specified")
+            val accessKeySecretValue =
+                accessKeySecret ?: throw IllegalArgumentException("Access key secret must be specified")
+            return OSSFS(
+                bucket = bucketValue,
+                endpoint = endpointValue,
+                accessKeyId = accessKeyIdValue,
+                accessKeySecret = accessKeySecretValue,
+                version = version,
+                options = options,
+            )
         }
     }
 }
@@ -391,7 +676,7 @@ class PVC private constructor(
  *
  * Each volume entry contains:
  * - A unique name identifier
- * - Exactly one backend (host, pvc) with backend-specific fields
+ * - Exactly one backend (host, pvc, ossfs) with backend-specific fields
  * - Common mount settings (mountPath, readOnly, subPath)
  *
  * Example usage:
@@ -413,8 +698,9 @@ class PVC private constructor(
  * ```
  *
  * @property name Unique identifier for the volume within the sandbox
- * @property host Host path bind mount backend (mutually exclusive with pvc)
- * @property pvc Kubernetes PVC mount backend (mutually exclusive with host)
+ * @property host Host path bind mount backend (mutually exclusive with pvc/ossfs)
+ * @property pvc Kubernetes PVC mount backend (mutually exclusive with host/ossfs)
+ * @property ossfs OSSFS mount backend (mutually exclusive with host/pvc)
  * @property mountPath Absolute path inside the container where the volume is mounted
  * @property readOnly If true, the volume is mounted as read-only. Defaults to false (read-write).
  * @property subPath Optional subdirectory under the backend path to mount
@@ -423,6 +709,7 @@ class Volume private constructor(
     val name: String,
     val host: Host?,
     val pvc: PVC?,
+    val ossfs: OSSFS?,
     val mountPath: String,
     val readOnly: Boolean,
     val subPath: String?,
@@ -436,6 +723,7 @@ class Volume private constructor(
         private var name: String? = null
         private var host: Host? = null
         private var pvc: PVC? = null
+        private var ossfs: OSSFS? = null
         private var mountPath: String? = null
         private var readOnly: Boolean = false
         private var subPath: String? = null
@@ -453,6 +741,11 @@ class Volume private constructor(
 
         fun pvc(pvc: PVC): Builder {
             this.pvc = pvc
+            return this
+        }
+
+        fun ossfs(ossfs: OSSFS): Builder {
+            this.ossfs = ossfs
             return this
         }
 
@@ -477,18 +770,23 @@ class Volume private constructor(
             val mountPathValue = mountPath ?: throw IllegalArgumentException("Mount path must be specified")
 
             // Validate exactly one backend is specified
-            val backendsSpecified = listOfNotNull(host, pvc).size
+            val backendsSpecified = listOfNotNull(host, pvc, ossfs).size
             if (backendsSpecified == 0) {
-                throw IllegalArgumentException("Exactly one backend (host, pvc) must be specified, but none was provided")
+                throw IllegalArgumentException(
+                    "Exactly one backend (host, pvc, ossfs) must be specified, but none was provided",
+                )
             }
             if (backendsSpecified > 1) {
-                throw IllegalArgumentException("Exactly one backend (host, pvc) must be specified, but multiple were provided")
+                throw IllegalArgumentException(
+                    "Exactly one backend (host, pvc, ossfs) must be specified, but multiple were provided",
+                )
             }
 
             return Volume(
                 name = nameValue,
                 host = host,
                 pvc = pvc,
+                ossfs = ossfs,
                 mountPath = mountPathValue,
                 readOnly = readOnly,
                 subPath = subPath,
@@ -506,7 +804,10 @@ class Volume private constructor(
  * @property expiresAt Timestamp when the sandbox is scheduled for automatic termination. Null means manual cleanup mode.
  * @property createdAt Timestamp when the sandbox was created
  * @property image Image specification used to create this sandbox
+ * @property platform Effective platform used for sandbox provisioning
  * @property metadata Custom metadata attached to the sandbox
+ * @property extensions Opaque extension data returned by the server
+ * @property allocation Current runtime-confirmed pool allocation, when available
  */
 class SandboxInfo(
     val id: String,
@@ -514,8 +815,50 @@ class SandboxInfo(
     val entrypoint: List<String>,
     val expiresAt: OffsetDateTime?,
     val createdAt: OffsetDateTime,
-    val image: SandboxImageSpec,
+    val image: SandboxImageSpec? = null,
+    val snapshotId: String? = null,
+    val platform: PlatformSpec? = null,
     val metadata: Map<String, String>? = null,
+    val extensions: Map<String, String>? = null,
+    val allocation: SandboxAllocation? = null,
+) {
+    constructor(
+        id: String,
+        status: SandboxStatus,
+        entrypoint: List<String>,
+        expiresAt: OffsetDateTime?,
+        createdAt: OffsetDateTime,
+        image: SandboxImageSpec?,
+        snapshotId: String?,
+        platform: PlatformSpec?,
+        metadata: Map<String, String>?,
+        extensions: Map<String, String>?,
+    ) : this(
+        id = id,
+        status = status,
+        entrypoint = entrypoint,
+        expiresAt = expiresAt,
+        createdAt = createdAt,
+        image = image,
+        snapshotId = snapshotId,
+        platform = platform,
+        metadata = metadata,
+        extensions = extensions,
+        allocation = null,
+    )
+}
+
+/**
+ * Current runtime-confirmed pool allocation for a sandbox.
+ *
+ * @property mode Confirmed allocation mode. Currently always `pool`.
+ * @property poolRef Concrete pool reference currently allocated to the sandbox.
+ * @property state Current confirmed allocation state. Currently always `allocated`.
+ */
+class SandboxAllocation(
+    val mode: String,
+    val poolRef: String,
+    val state: String,
 )
 
 /**
@@ -537,9 +880,152 @@ class SandboxStatus(
  * Response returned when a sandbox is created.
  *
  * @property id Unique identifier of the newly created sandbox
+ * @property platform Effective platform used for sandbox provisioning
+ * @property extensions Opaque extension data returned by the server
  */
 class SandboxCreateResponse(
     val id: String,
+    val platform: PlatformSpec? = null,
+    val extensions: Map<String, String>? = null,
+)
+
+/**
+ * Lifecycle state of a snapshot.
+ *
+ * Common state values:
+ * - Creating: Snapshot is being captured from the sandbox
+ * - Ready: Snapshot has been captured and can be used to restore a sandbox
+ * - Failed: Snapshot capture encountered a critical error
+ * - Deleting: Snapshot is being deleted
+ *
+ * State transitions:
+ * - Creating → Ready (capture completes successfully)
+ * - Creating → Failed (on error)
+ *
+ * Note: New state values may be added in future versions.
+ * Clients should handle unknown state values gracefully.
+ */
+object SnapshotState {
+    const val CREATING = "Creating"
+    const val READY = "Ready"
+    const val FAILED = "Failed"
+    const val DELETING = "Deleting"
+    const val UNKNOWN = "Unknown"
+}
+
+/**
+ * Artifact class of a snapshot.
+ *
+ * [FULL] is the runtime's most complete capture: memory and process state on
+ * the fast-sandbox backend (restoring resumes in place); Docker and Kubernetes
+ * snapshots capture the filesystem only and do not restore running processes.
+ * [ROOTFS_ONLY] preserves only the writable filesystem, so restoring boots a
+ * fresh sandbox and re-runs the entrypoint. It requires the fast-sandbox
+ * backend with OCI-backed sandboxes and is rejected by other backends.
+ *
+ * Note: snapshots created before the mode field existed report [FULL].
+ */
+object SnapshotMode {
+    const val FULL = "full"
+    const val ROOTFS_ONLY = "rootfsOnly"
+}
+
+class SnapshotStatus(
+    val state: String,
+    val reason: String?,
+    val message: String?,
+    val lastTransitionAt: OffsetDateTime?,
+)
+
+class SnapshotInfo(
+    val id: String,
+    val sandboxId: String,
+    val name: String? = null,
+    val status: SnapshotStatus,
+    val createdAt: OffsetDateTime,
+) {
+    /**
+     * Artifact class of the snapshot. Snapshots created before the mode field
+     * existed report [SnapshotMode.FULL].
+     */
+    var mode: String = SnapshotMode.FULL
+        private set
+
+    /**
+     * Mode-aware constructor. The five-parameter primary constructor keeps the
+     * published ABI — including the compiler-generated default-argument bridge
+     * for callers that omit [name] — intact for pre-upgrade binaries.
+     */
+    constructor(
+        id: String,
+        sandboxId: String,
+        name: String?,
+        status: SnapshotStatus,
+        createdAt: OffsetDateTime,
+        mode: String,
+    ) : this(id, sandboxId, name, status, createdAt) {
+        this.mode = mode
+    }
+}
+
+class SnapshotFilter private constructor(
+    val sandboxId: String?,
+    val name: String?,
+    val states: List<String>?,
+    val pageSize: Int?,
+    val page: Int?,
+) {
+    companion object {
+        @JvmStatic
+        fun builder(): Builder = Builder()
+    }
+
+    class Builder {
+        private var sandboxId: String? = null
+        private var name: String? = null
+        private var states: List<String>? = null
+        private var pageSize: Int? = null
+        private var page: Int? = null
+
+        fun sandboxId(sandboxId: String): Builder {
+            this.sandboxId = sandboxId
+            return this
+        }
+
+        fun name(name: String): Builder {
+            this.name = name
+            return this
+        }
+
+        fun states(states: List<String>): Builder {
+            this.states = states
+            return this
+        }
+
+        fun states(vararg states: String): Builder {
+            this.states = states.toList()
+            return this
+        }
+
+        fun pageSize(pageSize: Int): Builder {
+            require(pageSize > 0) { "Page size must be positive" }
+            this.pageSize = pageSize
+            return this
+        }
+
+        fun page(page: Int): Builder {
+            require(page > 0) { "Page must be positive" }
+            this.page = page
+            return this
+        }
+
+        fun build(): SnapshotFilter = SnapshotFilter(sandboxId, name, states, pageSize, page)
+    }
+}
+
+class PagedSnapshotInfos(
+    val snapshotInfos: List<SnapshotInfo>,
+    val pagination: PaginationInfo,
 )
 
 /**
@@ -556,10 +1042,12 @@ class SandboxRenewResponse(
  *
  * @property endpoint Sandbox endpoint
  * @property headers Headers that must be included on every request targeting this endpoint (e.g. when the server requires them for routing or auth). Empty if not required.
+ * @property origin Server-reported sandbox origin (see [SandboxOrigin]); null when the server does not report one. Only endpoint lookups carry it.
  */
 class SandboxEndpoint(
     val endpoint: String,
     val headers: Map<String, String> = emptyMap(),
+    val origin: String? = null,
 )
 
 /**

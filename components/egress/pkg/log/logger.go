@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,10 +21,10 @@ import (
 	slogger "github.com/alibaba/opensandbox/internal/logger"
 )
 
-// Logger is the shared logger instance for egress.
+// Logger is the package-global sink used by egress; WithLogger is called from main after OTel/fields setup.
 var Logger slogger.Logger = slogger.MustNew(slogger.Config{Level: "info"}).Named("opensandbox.egress")
 
-// WithLogger replaces the global logger used by egress components.
+// WithLogger installs the process-wide logger for the egress binary.
 func WithLogger(ctx context.Context, logger slogger.Logger) context.Context {
 	if logger != nil {
 		Logger = logger

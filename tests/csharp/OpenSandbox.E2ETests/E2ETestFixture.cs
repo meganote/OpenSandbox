@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,6 +25,8 @@ public sealed class E2ETestFixture : IAsyncLifetime
     public string DefaultImage { get; }
 
     public ConnectionConfig ConnectionConfig { get; }
+
+    public ConnectionConfig ServerProxyConnectionConfig { get; }
 
     public int DefaultTimeoutSeconds { get; } = 1200;
 
@@ -61,6 +63,15 @@ public sealed class E2ETestFixture : IAsyncLifetime
             Protocol = protocol,
             ApiKey = apiKey,
             RequestTimeoutSeconds = 180
+        });
+
+        ServerProxyConnectionConfig = new ConnectionConfig(new ConnectionConfigOptions
+        {
+            Domain = domain,
+            Protocol = protocol,
+            ApiKey = apiKey,
+            RequestTimeoutSeconds = 180,
+            UseServerProxy = true
         });
     }
 

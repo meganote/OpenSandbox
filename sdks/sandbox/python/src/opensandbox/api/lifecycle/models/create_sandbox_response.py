@@ -1,5 +1,5 @@
 #
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,7 +27,9 @@ from dateutil.parser import isoparse
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.create_sandbox_response_extensions import CreateSandboxResponseExtensions
     from ..models.create_sandbox_response_metadata import CreateSandboxResponseMetadata
+    from ..models.platform_spec import PlatformSpec
     from ..models.sandbox_status import SandboxStatus
 
 
@@ -36,16 +38,32 @@ T = TypeVar("T", bound="CreateSandboxResponse")
 
 @_attrs_define
 class CreateSandboxResponse:
-    """Response from creating a new sandbox. Contains essential information without image and updatedAt.
+    """Response from creating a new sandbox. Contains essential information without startup source details and updatedAt.
 
     Attributes:
         id (str): Unique sandbox identifier
         status (SandboxStatus): Detailed status information with lifecycle state and transition details
         created_at (datetime.datetime): Sandbox creation timestamp
-        entrypoint (list[str]): Entry process specification from creation request
+        entrypoint (list[str]): Entry process specification for the sandbox. For image-created sandboxes,
+            this is copied from the creation request. For snapshot-created sandboxes,
+            this is restored from the snapshot.
         metadata (CreateSandboxResponseMetadata | Unset): Custom metadata from creation request
-        expires_at (datetime.datetime | None | Unset): Timestamp when sandbox will auto-terminate. Null when manual
-            cleanup is enabled.
+        extensions (CreateSandboxResponseExtensions | Unset): Opaque extension data restored from provider-specific
+            storage
+        platform (PlatformSpec | Unset): Runtime platform constraint used for scheduling/provisioning.
+
+            This field is independent from `image` and expresses the expected target
+            OS and CPU architecture for sandbox execution.
+
+            Behavioral notes:
+            - If omitted, the runtime applies its own default platform selection behavior.
+              For Docker, requests are created without an explicit platform override.
+              For Kubernetes, no `kubernetes.io/os` or `kubernetes.io/arch` constraint
+              is injected unless provided by request or workload template.
+            - If provided and cannot be satisfied by runtime/template/pool constraints,
+              request must fail explicitly.
+        expires_at (datetime.datetime | Unset): Timestamp when sandbox will auto-terminate. Omitted when manual cleanup
+            is enabled.
     """
 
     id: str
@@ -53,7 +71,9 @@ class CreateSandboxResponse:
     created_at: datetime.datetime
     entrypoint: list[str]
     metadata: CreateSandboxResponseMetadata | Unset = UNSET
-    expires_at: datetime.datetime | None | Unset = UNSET
+    extensions: CreateSandboxResponseExtensions | Unset = UNSET
+    platform: PlatformSpec | Unset = UNSET
+    expires_at: datetime.datetime | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -69,13 +89,17 @@ class CreateSandboxResponse:
         if not isinstance(self.metadata, Unset):
             metadata = self.metadata.to_dict()
 
-        expires_at: None | str | Unset
-        if isinstance(self.expires_at, Unset):
-            expires_at = UNSET
-        elif isinstance(self.expires_at, datetime.datetime):
+        extensions: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.extensions, Unset):
+            extensions = self.extensions.to_dict()
+
+        platform: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.platform, Unset):
+            platform = self.platform.to_dict()
+
+        expires_at: str | Unset = UNSET
+        if not isinstance(self.expires_at, Unset):
             expires_at = self.expires_at.isoformat()
-        else:
-            expires_at = self.expires_at
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -89,6 +113,10 @@ class CreateSandboxResponse:
         )
         if metadata is not UNSET:
             field_dict["metadata"] = metadata
+        if extensions is not UNSET:
+            field_dict["extensions"] = extensions
+        if platform is not UNSET:
+            field_dict["platform"] = platform
         if expires_at is not UNSET:
             field_dict["expiresAt"] = expires_at
 
@@ -96,7 +124,9 @@ class CreateSandboxResponse:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.create_sandbox_response_extensions import CreateSandboxResponseExtensions
         from ..models.create_sandbox_response_metadata import CreateSandboxResponseMetadata
+        from ..models.platform_spec import PlatformSpec
         from ..models.sandbox_status import SandboxStatus
 
         d = dict(src_dict)
@@ -110,27 +140,31 @@ class CreateSandboxResponse:
 
         _metadata = d.pop("metadata", UNSET)
         metadata: CreateSandboxResponseMetadata | Unset
-        if isinstance(_metadata, Unset) or _metadata is None:
+        if isinstance(_metadata, Unset):
             metadata = UNSET
         else:
             metadata = CreateSandboxResponseMetadata.from_dict(_metadata)
 
-        def _parse_expires_at(data: object) -> datetime.datetime | None | Unset:
-            if data is None:
-                return data
-            if isinstance(data, Unset):
-                return data
-            try:
-                if not isinstance(data, str):
-                    raise TypeError()
-                expires_at_type_0 = isoparse(data)
+        _extensions = d.pop("extensions", UNSET)
+        extensions: CreateSandboxResponseExtensions | Unset
+        if isinstance(_extensions, Unset):
+            extensions = UNSET
+        else:
+            extensions = CreateSandboxResponseExtensions.from_dict(_extensions)
 
-                return expires_at_type_0
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
-            return cast(datetime.datetime | None | Unset, data)
+        _platform = d.pop("platform", UNSET)
+        platform: PlatformSpec | Unset
+        if isinstance(_platform, Unset):
+            platform = UNSET
+        else:
+            platform = PlatformSpec.from_dict(_platform)
 
-        expires_at = _parse_expires_at(d.pop("expiresAt", UNSET))
+        _expires_at = d.pop("expiresAt", UNSET)
+        expires_at: datetime.datetime | Unset
+        if isinstance(_expires_at, Unset):
+            expires_at = UNSET
+        else:
+            expires_at = isoparse(_expires_at)
 
         create_sandbox_response = cls(
             id=id,
@@ -138,6 +172,8 @@ class CreateSandboxResponse:
             created_at=created_at,
             entrypoint=entrypoint,
             metadata=metadata,
+            extensions=extensions,
+            platform=platform,
             expires_at=expires_at,
         )
 

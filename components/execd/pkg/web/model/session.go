@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,25 +18,28 @@ import (
 	"github.com/go-playground/validator/v10"
 )
 
-// CreateSessionRequest is the request body for creating a bash session.
 type CreateSessionRequest struct {
 	Cwd string `json:"cwd,omitempty"`
 }
 
-// CreateSessionResponse is the response for create_session.
 type CreateSessionResponse struct {
 	SessionID string `json:"session_id"`
 }
 
-// RunInSessionRequest is the request body for running code in an existing session.
 type RunInSessionRequest struct {
-	Code      string `json:"code" validate:"required"`
-	Cwd       string `json:"cwd,omitempty"`
-	TimeoutMs int64  `json:"timeout_ms,omitempty" validate:"omitempty,gte=0"`
+	Command string `json:"command" validate:"required"`
+	Cwd     string `json:"cwd,omitempty"`
+	Timeout int64  `json:"timeout,omitempty" validate:"omitempty,gte=0"`
 }
 
-// Validate validates RunInSessionRequest.
+// Validate performs structural validation only. The cwd is validated against
+// the target session's environment by the runtime (see
+// Controller.ValidateBashSessionCwd), because it can reference EXECD_ENVS
+// file variables and variables exported in earlier runs of the session.
 func (r *RunInSessionRequest) Validate() error {
 	validate := validator.New()
-	return validate.Struct(r)
+	if err := validate.Struct(r); err != nil {
+		return err
+	}
+	return nil
 }

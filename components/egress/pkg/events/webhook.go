@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -35,7 +35,6 @@ const (
 	defaultWebhookBackoff = 1 * time.Second
 )
 
-// WebhookSubscriber delivers blocked events to an HTTP endpoint.
 type WebhookSubscriber struct {
 	url        string
 	client     *http.Client
@@ -52,7 +51,7 @@ type webhookPayload struct {
 	SandboxID string `json:"sandboxId"`
 }
 
-// NewWebhookSubscriber builds a webhook subscriber with hardcoded timeout/retry settings.
+// NewWebhookSubscriber posts JSON to url with small retry/backoff (default queue consumer).
 func NewWebhookSubscriber(url string) *WebhookSubscriber {
 	if url == "" {
 		return nil
@@ -63,11 +62,10 @@ func NewWebhookSubscriber(url string) *WebhookSubscriber {
 		timeout:    defaultWebhookTimeout,
 		maxRetries: defaultWebhookRetries,
 		backoff:    defaultWebhookBackoff,
-		sandboxID:  os.Getenv(constants.ENVSandboxID),
+		sandboxID:  os.Getenv(constants.EnvSandboxID),
 	}
 }
 
-// HandleBlocked sends the blocked event to the configured webhook with retries.
 func (w *WebhookSubscriber) HandleBlocked(ctx context.Context, ev BlockedEvent) {
 	payload := webhookPayload{
 		Hostname:  ev.Hostname,
@@ -83,6 +81,9 @@ func (w *WebhookSubscriber) HandleBlocked(ctx context.Context, ev BlockedEvent) 
 
 	var lastErr error
 	for attempt := 0; attempt <= w.maxRetries; attempt++ {
+		if ctx.Err() != nil {
+			return
+		}
 		reqCtx := ctx
 		cancel := func() {}
 		if w.timeout > 0 {
@@ -116,7 +117,13 @@ func (w *WebhookSubscriber) HandleBlocked(ctx context.Context, ev BlockedEvent) 
 		cancel()
 		lastErr = err
 		if attempt < w.maxRetries {
-			time.Sleep(w.backoff * time.Duration(1<<attempt))
+			timer := time.NewTimer(w.backoff * time.Duration(1<<attempt))
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
 		}
 	}
 

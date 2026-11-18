@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Alibaba Group Holding Ltd.
+ * Copyright 2025 The OpenSandbox Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -62,7 +62,9 @@ class ExecutionEventDispatcher(
     ) {
         val stdoutText = eventNode.text ?: ""
         val stdoutMessage = OutputMessage(stdoutText, timestamp, false)
-        execution.logs.addStdout(stdoutMessage)
+        if (handlers?.skipAccumulation != true) {
+            execution.logs.addStdout(stdoutMessage)
+        }
         handlers?.onStdout?.handle(stdoutMessage)
     }
 
@@ -72,7 +74,9 @@ class ExecutionEventDispatcher(
     ) {
         val stderrText = eventNode.text ?: ""
         val stderrMessage = OutputMessage(stderrText, timestamp, true)
-        execution.logs.addStderr(stderrMessage)
+        if (handlers?.skipAccumulation != true) {
+            execution.logs.addStderr(stderrMessage)
+        }
         handlers?.onStderr?.handle(stderrMessage)
     }
 
@@ -93,13 +97,15 @@ class ExecutionEventDispatcher(
         eventNode: EventNode,
         timestamp: Long,
     ) {
-        val errorData = eventNode.error!!
+        // Ignore malformed error events rather than throwing past dispatch.
+        val errorData = eventNode.error ?: return
         val error =
             ExecutionError(
                 name = errorData.name ?: "",
                 value = errorData.value ?: "",
                 traceback = errorData.traceback,
                 timestamp = timestamp,
+                exitCode = errorData.exitCode?.toInt(),
             )
         execution.error = error
         handlers?.onError?.handle(error)
@@ -113,7 +119,9 @@ class ExecutionEventDispatcher(
             ExecutionComplete(
                 executionTimeInMillis = eventNode.executionTimeInMillis ?: 0L,
                 timestamp = timestamp,
+                exitCode = eventNode.exitCode?.toInt(),
             )
+        execution.complete = complete
         handlers?.onExecutionComplete?.handle(complete)
     }
 }

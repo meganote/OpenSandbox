@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Alibaba Group Holding Ltd.
+ * Copyright 2025 The OpenSandbox Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,7 +16,8 @@
 
 package com.alibaba.opensandbox.sandbox.domain.models.execd.executions
 
-import kotlin.time.Duration
+import java.time.Duration
+import kotlin.time.toJavaDuration
 
 /**
  * Parameters for command execution.
@@ -32,6 +33,7 @@ import kotlin.time.Duration
  */
 class RunCommandRequest private constructor(
     val command: String,
+    val argv: List<String>?,
     val background: Boolean,
     val workingDirectory: String?,
     val timeout: Duration?,
@@ -47,6 +49,7 @@ class RunCommandRequest private constructor(
 
     class Builder {
         private var command: String? = null
+        private var argv: List<String>? = null
         private var background: Boolean = false
         private var workingDirectory: String? = null
         private var timeout: Duration? = null
@@ -58,6 +61,14 @@ class RunCommandRequest private constructor(
         fun command(command: String): Builder {
             require(command.isNotBlank()) { "Command cannot be blank" }
             this.command = command
+            return this
+        }
+
+        fun argv(argv: List<String>): Builder {
+            require(argv.isNotEmpty() && argv[0].isNotEmpty() && argv.none { '\u0000' in it }) {
+                "Argv requires a non-empty executable and strings without NUL"
+            }
+            this.argv = argv.toList()
             return this
         }
 
@@ -75,9 +86,17 @@ class RunCommandRequest private constructor(
          * Maximum execution time; server will terminate the command when reached.
          * If omitted, the server will not enforce any timeout.
          */
-        fun timeout(timeout: Duration?): Builder {
+        fun timeout(timeout: Duration): Builder {
             this.timeout = timeout
             return this
+        }
+
+        @Deprecated(
+            message = "Use java.time.Duration instead.",
+            replaceWith = ReplaceWith("timeout(timeout.toJavaDuration())", "kotlin.time.toJavaDuration"),
+        )
+        fun timeout(timeout: kotlin.time.Duration): Builder {
+            return timeout(timeout.toJavaDuration())
         }
 
         fun uid(uid: Int?): Builder {
@@ -115,10 +134,12 @@ class RunCommandRequest private constructor(
         }
 
         fun build(): RunCommandRequest {
-            val commandValue = command ?: throw IllegalArgumentException("Command must be specified")
+            require((command != null) != (argv != null)) { "Exactly one of command or argv is required" }
+            val commandValue = command.orEmpty()
             require(gid == null || uid != null) { "Uid is required when gid is provided" }
             return RunCommandRequest(
                 command = commandValue,
+                argv = argv,
                 background = background,
                 workingDirectory = workingDirectory,
                 timeout = timeout,

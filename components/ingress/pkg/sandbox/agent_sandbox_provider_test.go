@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -32,7 +32,7 @@ import (
 func buildUnstructuredSandbox(name, namespace string) *unstructured.Unstructured {
 	return &unstructured.Unstructured{
 		Object: map[string]any{
-			"apiVersion": agentSandboxGroup + "/" + agentSandboxVersion,
+			"apiVersion": "agents.x-k8s.io/v1beta1",
 			"kind":       "Sandbox",
 			"metadata": map[string]any{
 				"name":      name,
@@ -56,19 +56,21 @@ func TestAgentSandboxProvider_Start_Success(t *testing.T) {
 	obj := buildUnstructuredSandbox("demo", namespace)
 	scheme := runtime.NewScheme()
 	gvr := schema.GroupVersionResource{
-		Group:    agentSandboxGroup,
-		Version:  agentSandboxVersion,
-		Resource: agentSandboxResource,
+		Group:    "agents.x-k8s.io",
+		Version:  "v1beta1",
+		Resource: "sandboxes",
 	}
 	fakeDyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
 		scheme,
 		map[schema.GroupVersionResource]string{
 			gvr: "SandboxList",
 		},
-		obj,
 	)
+	// Register explicitly: the fake client's plural guessing does not produce "sandboxes".
+	assert.NoError(t, fakeDyn.Tracker().Create(gvr, obj, namespace))
 
-	provider := newAgentSandboxProviderWithClient(fakeDyn, namespace, 30*time.Second)
+	provider := newAgentSandboxProviderWithClient(fakeDyn, 30*time.Second)
+	assert.Equal(t, gvr, provider.gvr)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -76,18 +78,21 @@ func TestAgentSandboxProvider_Start_Success(t *testing.T) {
 	err := provider.Start(ctx)
 	assert.NoError(t, err, "Start should succeed with fake dynamic informer")
 
-	// Manually seed store (fake dynamic client doesn't backfill informer cache automatically)
-	err = provider.informer.GetStore().Add(obj)
-	assert.NoError(t, err)
-
 	key := obj.GetNamespace() + "/" + obj.GetName()
 	_, exists, _ := provider.informer.GetStore().GetByKey(key)
-	assert.True(t, exists, "informer cache should accept added object after start")
+	assert.True(t, exists, "informer should list v1beta1 objects into its cache")
+	assert.Eventually(t, func() bool {
+		listed, watched := false, false
+		for _, action := range fakeDyn.Actions() {
+			assert.Equal(t, gvr, action.GetResource())
+			listed = listed || action.GetVerb() == "list"
+			watched = watched || action.GetVerb() == "watch"
+		}
+		return listed && watched
+	}, time.Second, 10*time.Millisecond)
 }
 
 func TestAgentSandboxProvider_Start_ContextCancelled(t *testing.T) {
-	namespace := "test-ns"
-
 	scheme := runtime.NewScheme()
 	gvr := schema.GroupVersionResource{
 		Group:    agentSandboxGroup,
@@ -101,7 +106,7 @@ func TestAgentSandboxProvider_Start_ContextCancelled(t *testing.T) {
 		},
 	)
 
-	provider := newAgentSandboxProviderWithClient(fakeDyn, namespace, 30*time.Second)
+	provider := newAgentSandboxProviderWithClient(fakeDyn, 30*time.Second)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel before start
@@ -136,7 +141,7 @@ func TestAgentSandboxProvider_GetEndpoint_ServiceFQDN(t *testing.T) {
 		},
 	)
 
-	provider := newAgentSandboxProviderWithClient(fakeDyn, namespace, 30*time.Second)
+	provider := newAgentSandboxProviderWithClient(fakeDyn, 30*time.Second)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -149,12 +154,10 @@ func TestAgentSandboxProvider_GetEndpoint_ServiceFQDN(t *testing.T) {
 
 	endpoint, err := provider.GetEndpoint("demo")
 	assert.NoError(t, err)
-	assert.Equal(t, "sandbox.demo.svc.cluster.local", endpoint)
+	assert.Equal(t, "sandbox.demo.svc.cluster.local", endpoint.Endpoint)
 }
 
 func TestAgentSandboxProvider_GetEndpoint_NotFound(t *testing.T) {
-	namespace := "test-ns"
-
 	scheme := runtime.NewScheme()
 	gvr := schema.GroupVersionResource{
 		Group:    agentSandboxGroup,
@@ -168,7 +171,7 @@ func TestAgentSandboxProvider_GetEndpoint_NotFound(t *testing.T) {
 		},
 	)
 
-	provider := newAgentSandboxProviderWithClient(fakeDyn, namespace, 30*time.Second)
+	provider := newAgentSandboxProviderWithClient(fakeDyn, 30*time.Second)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -198,7 +201,7 @@ func TestAgentSandboxProvider_GetEndpoint_NoServiceFQDN(t *testing.T) {
 		},
 	)
 
-	provider := newAgentSandboxProviderWithClient(fakeDyn, namespace, 30*time.Second)
+	provider := newAgentSandboxProviderWithClient(fakeDyn, 30*time.Second)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -242,7 +245,7 @@ func TestAgentSandboxProvider_GetEndpoint_NotReadyCondition(t *testing.T) {
 		},
 	)
 
-	provider := newAgentSandboxProviderWithClient(fakeDyn, namespace, 30*time.Second)
+	provider := newAgentSandboxProviderWithClient(fakeDyn, 30*time.Second)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -256,6 +259,91 @@ func TestAgentSandboxProvider_GetEndpoint_NotReadyCondition(t *testing.T) {
 	_, err = provider.GetEndpoint("demo")
 	assert.Error(t, err)
 	assert.True(t, errors.Is(err, ErrSandboxNotReady))
+}
+
+func TestAgentSandboxProvider_GetEndpoint_GlobalWatchAcrossNamespaces(t *testing.T) {
+	actualNamespace := "another-ns"
+	obj := buildUnstructuredSandbox("demo", actualNamespace)
+	obj.Object["status"] = map[string]any{
+		"serviceFQDN": "sandbox.demo.svc.cluster.local",
+		"conditions": []any{
+			map[string]any{
+				"type":   "Ready",
+				"status": "True",
+			},
+		},
+	}
+
+	scheme := runtime.NewScheme()
+	gvr := schema.GroupVersionResource{
+		Group:    agentSandboxGroup,
+		Version:  agentSandboxVersion,
+		Resource: agentSandboxResource,
+	}
+	fakeDyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		scheme,
+		map[schema.GroupVersionResource]string{
+			gvr: "SandboxList",
+		},
+	)
+	provider := newAgentSandboxProviderWithClient(fakeDyn, 30*time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	assert.NoError(t, provider.Start(ctx))
+	assert.NoError(t, provider.informer.GetStore().Add(obj))
+
+	endpoint, err := provider.GetEndpoint("demo")
+	assert.NoError(t, err)
+	assert.Equal(t, "sandbox.demo.svc.cluster.local", endpoint.Endpoint)
+}
+
+func TestAgentSandboxProvider_GetEndpoint_AmbiguousAcrossNamespaces(t *testing.T) {
+	name := "demo"
+	first := buildUnstructuredSandbox(name, "ns-a")
+	first.Object["status"] = map[string]any{
+		"serviceFQDN": "sandbox.demo.ns-a.svc.cluster.local",
+		"conditions": []any{
+			map[string]any{
+				"type":   "Ready",
+				"status": "True",
+			},
+		},
+	}
+	second := buildUnstructuredSandbox(name, "ns-b")
+	second.Object["status"] = map[string]any{
+		"serviceFQDN": "sandbox.demo.ns-b.svc.cluster.local",
+		"conditions": []any{
+			map[string]any{
+				"type":   "Ready",
+				"status": "True",
+			},
+		},
+	}
+
+	scheme := runtime.NewScheme()
+	gvr := schema.GroupVersionResource{
+		Group:    agentSandboxGroup,
+		Version:  agentSandboxVersion,
+		Resource: agentSandboxResource,
+	}
+	fakeDyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		scheme,
+		map[schema.GroupVersionResource]string{
+			gvr: "SandboxList",
+		},
+	)
+	provider := newAgentSandboxProviderWithClient(fakeDyn, 30*time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	assert.NoError(t, provider.Start(ctx))
+	assert.NoError(t, provider.informer.GetStore().Add(first))
+	assert.NoError(t, provider.informer.GetStore().Add(second))
+
+	_, err := provider.GetEndpoint(name)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "ambiguous sandbox id")
 }
 
 func TestToDNS1035Label_HashOnSymbolOnlyIDs(t *testing.T) {

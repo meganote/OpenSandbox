@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -33,6 +33,7 @@ public class OptionsTests
             Entrypoint = new[] { "bash" },
             Env = new Dictionary<string, string> { ["KEY"] = "VALUE" },
             Metadata = new Dictionary<string, string> { ["tag"] = "test" },
+            Platform = new PlatformSpec { Os = "linux", Arch = "arm64" },
             Resource = new Dictionary<string, string> { ["cpu"] = "2" },
             SkipHealthCheck = true,
             ReadyTimeoutSeconds = 60,
@@ -45,6 +46,8 @@ public class OptionsTests
         options.Entrypoint.Should().Contain("bash");
         options.Env.Should().ContainKey("KEY");
         options.Metadata.Should().ContainKey("tag");
+        options.Platform.Should().NotBeNull();
+        options.Platform!.Arch.Should().Be("arm64");
         options.Resource.Should().ContainKey("cpu");
         options.SkipHealthCheck.Should().BeTrue();
         options.ReadyTimeoutSeconds.Should().Be(60);

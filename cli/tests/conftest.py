@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,46 +16,10 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
-
 import pytest
 from click.testing import CliRunner
-
-from opensandbox_cli.output import OutputFormatter
 
 
 @pytest.fixture()
 def runner() -> CliRunner:
     return CliRunner()
-
-
-@pytest.fixture()
-def mock_manager() -> MagicMock:
-    return MagicMock()
-
-
-@pytest.fixture()
-def mock_sandbox() -> MagicMock:
-    return MagicMock()
-
-
-@pytest.fixture()
-def mock_client_context(mock_manager: MagicMock, mock_sandbox: MagicMock) -> MagicMock:
-    """A mock ClientContext that avoids real SDK/HTTP calls."""
-    ctx = MagicMock()
-    ctx.resolved_config = {
-        "api_key": "test-key",
-        "domain": "localhost:8080",
-        "protocol": "http",
-        "request_timeout": 30,
-        "output_format": "json",
-        "color": False,
-        "default_image": None,
-        "default_timeout": None,
-    }
-    ctx.output = OutputFormatter("json", color=False)
-    ctx.get_manager.return_value = mock_manager
-    ctx.connect_sandbox.return_value = mock_sandbox
-    ctx.connection_config = MagicMock()
-    ctx.close = MagicMock()
-    return ctx
